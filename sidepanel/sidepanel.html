@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Multi-Page Automation</title>
+  <title>多页面自动化</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -19,18 +19,18 @@
     </div>
     <div class="header-btns">
       <div class="run-group">
-        <input type="number" id="input-run-count" class="run-count-input" value="1" min="1" max="50" title="Number of runs" />
-        <button id="btn-auto-run" class="btn btn-success" title="Run all steps automatically">
+        <input type="number" id="input-run-count" class="run-count-input" value="1" min="1" max="50" title="运行次数" />
+        <button id="btn-auto-run" class="btn btn-success" title="自动执行全部步骤">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-          Auto
+          自动
         </button>
       </div>
-      <button id="btn-reset" class="btn btn-ghost" title="Reset all steps">
+      <button id="btn-reset" class="btn btn-ghost" title="重置全部步骤">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
         </svg>
       </button>
-      <button id="btn-theme" class="theme-toggle" title="Toggle theme">
+      <button id="btn-theme" class="theme-toggle" title="切换主题">
         <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
         </svg>
@@ -44,89 +44,99 @@
   <section id="data-section">
     <div class="data-card">
       <div class="data-row">
-        <span class="data-label">VPS</span>
+        <span class="data-label">CPA 接口</span>
         <input type="password" id="input-vps-url" class="data-input" placeholder="http://ip:port/management.html#/oauth" />
       </div>
       <div class="data-row">
-        <span class="data-label">Mail</span>
+        <span class="data-label">邮箱</span>
         <select id="select-mail-provider" class="data-select">
-          <option value="163">163 Mail (mail.163.com)</option>
-          <option value="qq">QQ Mail (wx.mail.qq.com)</option>
+          <option value="163">163 邮箱 (mail.163.com)</option>
+          <option value="qq">QQ 邮箱 (wx.mail.qq.com)</option>
+          <option value="2925">2925 邮箱 (2925.com)</option>
         </select>
       </div>
-      <div class="data-row">
-        <span class="data-label">Email</span>
-        <input type="text" id="input-email" class="data-input" placeholder="Paste DuckDuckGo email" />
+      <div class="data-row" id="row-email-prefix" style="display:none;">
+        <span class="data-label">邮箱前缀</span>
+        <input type="text" id="input-email-prefix" class="data-input" placeholder="输入前缀，如 abc" />
+      </div>
+      <div class="data-row" id="row-email">
+        <span class="data-label">邮箱地址</span>
+        <input type="text" id="input-email" class="data-input" placeholder="粘贴 DuckDuckGo 邮箱" />
       </div>
       <div class="data-row">
         <span class="data-label">OAuth</span>
-        <span id="display-oauth-url" class="data-value mono truncate">Waiting...</span>
+        <span id="display-oauth-url" class="data-value mono truncate">等待中...</span>
       </div>
       <div class="data-row">
-        <span class="data-label">Callback</span>
-        <span id="display-localhost-url" class="data-value mono truncate">Waiting...</span>
+        <span class="data-label">回调</span>
+        <span id="display-localhost-url" class="data-value mono truncate">等待中...</span>
       </div>
     </div>
     <div id="status-bar" class="status-bar">
       <div class="status-dot"></div>
-      <span id="display-status">Ready</span>
+      <span id="display-status">就绪</span>
     </div>
     <div id="auto-continue-bar" class="auto-continue-bar" style="display:none;">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-      <span class="auto-hint">Paste email above, then continue</span>
-      <button id="btn-auto-continue" class="btn btn-primary btn-sm">Continue</button>
+      <span class="auto-hint">先粘贴邮箱，再继续</span>
+      <button id="btn-auto-continue" class="btn btn-primary btn-sm">继续</button>
+    </div>
+    <div id="manual-intervention-bar" class="manual-intervention-bar" style="display:none;">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      <span id="manual-intervention-text" class="manual-hint">当前步骤需要人工介入，处理完成后继续下一步</span>
+      <button id="btn-manual-continue" class="btn btn-primary btn-sm">人工处理完成，继续下一步</button>
     </div>
   </section>
 
   <section id="steps-section">
     <div class="steps-header">
-      <span class="section-label">Workflow</span>
+      <span class="section-label">流程</span>
       <span id="steps-progress" class="steps-progress">0 / 9</span>
     </div>
     <div class="steps-list">
       <div class="step-row" data-step="1">
         <div class="step-indicator" data-step="1"><span class="step-num">1</span></div>
-        <button class="step-btn" data-step="1">Get OAuth Link</button>
+        <button class="step-btn" data-step="1">获取 OAuth 链接</button>
         <span class="step-status" data-step="1"></span>
       </div>
       <div class="step-row" data-step="2">
         <div class="step-indicator" data-step="2"><span class="step-num">2</span></div>
-        <button class="step-btn" data-step="2">Open Signup</button>
+        <button class="step-btn" data-step="2">打开注册页</button>
         <span class="step-status" data-step="2"></span>
       </div>
       <div class="step-row" data-step="3">
         <div class="step-indicator" data-step="3"><span class="step-num">3</span></div>
-        <button class="step-btn" data-step="3">Fill Email / Password</button>
+        <button class="step-btn" data-step="3">填写邮箱 / 密码</button>
         <span class="step-status" data-step="3"></span>
       </div>
       <div class="step-row" data-step="4">
         <div class="step-indicator" data-step="4"><span class="step-num">4</span></div>
-        <button class="step-btn" data-step="4">Get Signup Code</button>
+        <button class="step-btn" data-step="4">获取注册验证码</button>
         <span class="step-status" data-step="4"></span>
       </div>
       <div class="step-row" data-step="5">
         <div class="step-indicator" data-step="5"><span class="step-num">5</span></div>
-        <button class="step-btn" data-step="5">Fill Name / Birthday</button>
+        <button class="step-btn" data-step="5">填写姓名 / 生日</button>
         <span class="step-status" data-step="5"></span>
       </div>
       <div class="step-row" data-step="6">
         <div class="step-indicator" data-step="6"><span class="step-num">6</span></div>
-        <button class="step-btn" data-step="6">Login via OAuth</button>
+        <button class="step-btn" data-step="6">OAuth 登录</button>
         <span class="step-status" data-step="6"></span>
       </div>
       <div class="step-row" data-step="7">
         <div class="step-indicator" data-step="7"><span class="step-num">7</span></div>
-        <button class="step-btn" data-step="7">Get Login Code</button>
+        <button class="step-btn" data-step="7">获取登录验证码</button>
         <span class="step-status" data-step="7"></span>
       </div>
       <div class="step-row" data-step="8">
         <div class="step-indicator" data-step="8"><span class="step-num">8</span></div>
-        <button class="step-btn" data-step="8">Complete OAuth</button>
+        <button class="step-btn" data-step="8">完成 OAuth</button>
         <span class="step-status" data-step="8"></span>
       </div>
       <div class="step-row" data-step="9">
         <div class="step-indicator" data-step="9"><span class="step-num">9</span></div>
-        <button class="step-btn" data-step="9">VPS Verify</button>
+        <button class="step-btn" data-step="9">CPA 接口验证</button>
         <span class="step-status" data-step="9"></span>
       </div>
     </div>
@@ -134,8 +144,8 @@
 
   <section id="log-section">
     <div class="log-header">
-      <span class="section-label">Console</span>
-      <button id="btn-clear-log" class="btn btn-ghost btn-xs" title="Clear log">Clear</button>
+      <span class="section-label">日志</span>
+      <button id="btn-clear-log" class="btn btn-ghost btn-xs" title="清空日志">清空</button>
     </div>
     <div id="log-area"></div>
   </section>

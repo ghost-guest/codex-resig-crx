@@ -25,7 +25,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     handlePollEmail(message.step, message.payload).then(result => {
       sendResponse(result);
     }).catch(err => {
-      reportError(message.step, err.message);
+      // POLL_EMAIL failures are handled by background retry/resend cycles.
+      // Do not emit STEP_ERROR here, otherwise the step waiter is rejected too early.
       sendResponse({ error: err.message });
     });
     return true; // async response
@@ -49,9 +50,17 @@ function getCurrentMailIds() {
 // ============================================================
 
 async function handlePollEmail(step, payload) {
-  const { senderFilters, subjectFilters, maxAttempts, intervalMs } = payload;
+  const {
+    senderFilters,
+    subjectFilters,
+    maxAttempts,
+    intervalMs,
+    excludeCodes = [],
+    strictChatGPTCodeOnly = false,
+  } = payload;
 
   log(`Step ${step}: Starting email poll (max ${maxAttempts} attempts, every ${intervalMs / 1000}s)`);
+  await sleepRandom(1200, 2200);
 
   // Wait for mail list to load
   try {
@@ -75,7 +84,7 @@ async function handlePollEmail(step, payload) {
     // Refresh inbox (skip on first attempt, list is fresh)
     if (attempt > 1) {
       await refreshInbox();
-      await sleep(800);
+      await sleepRandom(700, 1200);
     }
 
     const allItems = document.querySelectorAll('.mail-list-page-item[data-mailid]');
@@ -96,8 +105,12 @@ async function handlePollEmail(step, payload) {
       const subjectMatch = subjectFilters.some(f => subject.includes(f.toLowerCase()));
 
       if (senderMatch || subjectMatch) {
-        const code = extractVerificationCode(subject + ' ' + digest);
+        const code = extractVerificationCode(subject + ' ' + digest, strictChatGPTCodeOnly);
         if (code) {
+          if (excludeCodes.includes(code)) {
+            log(`Step ${step}: Skipping excluded code: ${code}`, 'info');
+            continue;
+          }
           const source = useFallback && existingMailIds.has(mailId) ? 'fallback-first-match' : 'new';
           log(`Step ${step}: Code found: ${code} (${source}, subject: ${subject.slice(0, 40)})`, 'ok');
           return { ok: true, code, emailTimestamp: Date.now(), mailId };
@@ -110,7 +123,7 @@ async function handlePollEmail(step, payload) {
     }
 
     if (attempt < maxAttempts) {
-      await sleep(intervalMs);
+      await sleepRandom(intervalMs, intervalMs + 1200);
     }
   }
 
@@ -132,7 +145,7 @@ async function refreshInbox() {
   if (refreshBtn) {
     simulateClick(refreshBtn);
     console.log(QQ_MAIL_PREFIX, 'Clicked refresh button');
-    await sleep(500);
+    await sleepRandom(400, 800);
     return;
   }
 
@@ -141,7 +154,7 @@ async function refreshInbox() {
   if (sidebarInbox) {
     simulateClick(sidebarInbox);
     console.log(QQ_MAIL_PREFIX, 'Clicked sidebar inbox');
-    await sleep(500);
+    await sleepRandom(400, 800);
     return;
   }
 
@@ -150,7 +163,7 @@ async function refreshInbox() {
   if (folderName) {
     simulateClick(folderName);
     console.log(QQ_MAIL_PREFIX, 'Clicked toolbar folder name');
-    await sleep(500);
+    await sleepRandom(400, 800);
   }
 }
 
@@ -158,7 +171,12 @@ async function refreshInbox() {
 // Verification Code Extraction
 // ============================================================
 
-function extractVerificationCode(text) {
+function extractVerificationCode(text, strictChatGPTCodeOnly = false) {
+  if (strictChatGPTCodeOnly) {
+    const strictMatch = text.match(/your\s+chatgpt\s+code\s+is\s+(\d{6})/i);
+    return strictMatch ? strictMatch[1] : null;
+  }
+
   // Pattern 1: Chinese format "代码为 370794" or "验证码...370794"
   const matchCn = text.match(/(?:代码为|验证码[^0-9]*?)[\s：:]*(\d{6})/);
   if (matchCn) return matchCn[1];

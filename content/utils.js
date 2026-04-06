@@ -5,6 +5,7 @@ const SCRIPT_SOURCE = (() => {
   if (url.includes('auth0.openai.com') || url.includes('auth.openai.com') || url.includes('accounts.openai.com')) return 'signup-page';
   if (url.includes('mail.qq.com')) return 'qq-mail';
   if (url.includes('mail.163.com')) return 'mail-163';
+  if (url.includes('2925.com')) return 'mail-2925';
   if (url.includes('chatgpt.com')) return 'chatgpt';
   // VPS panel — detected dynamically since URL is configurable
   return 'vps-panel';
@@ -223,9 +224,25 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// Auto-report ready on load
-// Skip ready signal from child iframes of mail pages to avoid overwriting the top frame's registration
+/**
+ * Wait a random number of milliseconds within a range.
+ * @param {number} minMs
+ * @param {number} maxMs
+ * @returns {Promise<void>}
+ */
+function sleepRandom(minMs, maxMs = minMs) {
+  const lower = Math.max(0, Math.min(minMs, maxMs));
+  const upper = Math.max(minMs, maxMs);
+  const delay = lower + Math.floor(Math.random() * (upper - lower + 1));
+  return sleep(delay);
+}
+
+// Auto-report ready on load — only for pages with a known SCRIPT_SOURCE.
+// Skip child iframes of mail pages to avoid overwriting the top frame's registration.
+// For the VPS panel (user-configurable URL, SCRIPT_SOURCE defaults to 'vps-panel'),
+// reportReady is NOT called here; vps-panel.js calls it explicitly instead.
 const _isMailChildFrame = (SCRIPT_SOURCE === 'qq-mail' || SCRIPT_SOURCE === 'mail-163') && window !== window.top;
-if (!_isMailChildFrame) {
+const _knownSource = SCRIPT_SOURCE !== 'vps-panel';
+if (_knownSource && !_isMailChildFrame) {
   reportReady();
 }

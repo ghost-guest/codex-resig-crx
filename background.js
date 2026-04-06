@@ -3,6 +3,9 @@
 importScripts('data/names.js');
 
 const LOG_PREFIX = '[MultiPage:bg]';
+const LOCAL_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
+const LOCAL_OAUTH_REDIRECT_URI = 'http://localhost:1455/auth/callback';
+const MAX_RESTARTS_PER_RUN = 2;
 
 // ============================================================
 // State Management (chrome.storage.session)
@@ -19,12 +22,17 @@ const DEFAULT_STATE = {
   password: null,
   accounts: [], // { email, password, createdAt }
   lastEmailTimestamp: null,
+  signupVerificationCode: null,
   localhostUrl: null,
   flowStartTime: null,
   tabRegistry: {},
   logs: [],
   vpsUrl: '',
   mailProvider: '163', // 'qq' or '163'
+  emailPrefix: '',
+  oauthCodeVerifier: null,
+  oauthState: null,
+  manualIntervention: null,
 };
 
 async function getState() {
@@ -40,7 +48,7 @@ async function setState(updates) {
 async function resetState() {
   console.log(LOG_PREFIX, 'Resetting all state');
   // Preserve settings and persistent data across resets
-  const prev = await chrome.storage.session.get(['seenCodes', 'accounts', 'tabRegistry', 'vpsUrl', 'mailProvider']);
+  const prev = await chrome.storage.session.get(['seenCodes', 'accounts', 'tabRegistry', 'vpsUrl', 'mailProvider', 'emailPrefix']);
   await chrome.storage.session.clear();
   await chrome.storage.session.set({
     ...DEFAULT_STATE,
@@ -49,6 +57,7 @@ async function resetState() {
     tabRegistry: prev.tabRegistry || {},
     vpsUrl: prev.vpsUrl || '',
     mailProvider: prev.mailProvider || '163',
+    emailPrefix: prev.emailPrefix || '',
   });
 }
 
@@ -76,6 +85,122 @@ function generatePassword() {
 
   // Shuffle
   return pw.split('').sort(() => Math.random() - 0.5).join('');
+}
+
+function base64UrlEncode(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function randomHex(n) {
+  const a = new Uint8Array(n);
+  crypto.getRandomValues(a);
+  return Array.from(a).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function buildLocalOAuthUrl() {
+  const verifierBytes = new Uint8Array(32);
+  crypto.getRandomValues(verifierBytes);
+  const codeVerifier = base64UrlEncode(verifierBytes);
+
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier));
+  const codeChallenge = base64UrlEncode(new Uint8Array(digest));
+  const state = randomHex(16);
+
+  const params = new URLSearchParams({
+    client_id: LOCAL_OAUTH_CLIENT_ID,
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256',
+    codex_cli_simplified_flow: 'true',
+    id_token_add_organizations: 'true',
+    prompt: 'login',
+    redirect_uri: LOCAL_OAUTH_REDIRECT_URI,
+    response_type: 'code',
+    scope: 'openid email profile offline_access',
+    state,
+  });
+
+  return {
+    oauthUrl: `https://auth.openai.com/oauth/authorize?${params.toString()}`,
+    codeVerifier,
+    state,
+  };
+}
+
+function parseCallbackFromUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    return {
+      code: u.searchParams.get('code') || '',
+      state: u.searchParams.get('state') || '',
+      error: u.searchParams.get('error') || '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function exchangeTokenWithOpenAI(code, codeVerifier) {
+  const body = new URLSearchParams({
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: LOCAL_OAUTH_REDIRECT_URI,
+    client_id: LOCAL_OAUTH_CLIENT_ID,
+    code_verifier: codeVerifier,
+  }).toString();
+
+  const resp = await fetch('https://auth.openai.com/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error(`Token exchange failed ${resp.status}: ${txt}`);
+  }
+
+  return resp.json();
+}
+
+function parseJwtPayload(token) {
+  if (!token || token.split('.').length < 2) return {};
+  try {
+    const payload = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = payload + '='.repeat((4 - (payload.length % 4)) % 4);
+    return JSON.parse(atob(padded));
+  } catch {
+    return {};
+  }
+}
+
+function toPseudoPlus8ISOString(date) {
+  // Keep backward compatibility with existing token file format expectations.
+  return date.toISOString().replace(/\.\d{3}Z$/, '+08:00');
+}
+
+function buildCodexTokenFile(tokens) {
+  const accessPayload = parseJwtPayload(tokens.access_token || '');
+  const idPayload = parseJwtPayload(tokens.id_token || '');
+  const apiAuth = accessPayload['https://api.openai.com/auth'] || {};
+  const accountId = apiAuth.chatgpt_account_id || '';
+  const email = idPayload.email || '';
+
+  const now = new Date();
+  const expiredAt = new Date(now.getTime() + (tokens.expires_in || 3600) * 1000);
+
+  return {
+    access_token: tokens.access_token || '',
+    account_id: accountId,
+    disabled: false,
+    email,
+    expired: toPseudoPlus8ISOString(expiredAt),
+    id_token: tokens.id_token || '',
+    last_refresh: toPseudoPlus8ISOString(now),
+    refresh_token: tokens.refresh_token || '',
+    type: 'codex',
+  };
 }
 
 // ============================================================
@@ -143,6 +268,21 @@ function flushCommand(source, tabId) {
   }
 }
 
+async function waitForContentScriptReady(source, expectedTabId, timeout = 15000) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeout) {
+    const registry = await getTabRegistry();
+    const entry = registry[source];
+    if (entry?.ready && (!expectedTabId || entry.tabId === expectedTabId)) {
+      return true;
+    }
+    await sleep(250);
+  }
+
+  return false;
+}
+
 // ============================================================
 // Reuse or create tab
 // ============================================================
@@ -182,8 +322,10 @@ async function reuseOrCreateTab(source, url, options = {}) {
       });
     }
 
-    // Wait a bit for content script to inject and send READY
-    await new Promise(r => setTimeout(r, 500));
+    const ready = await waitForContentScriptReady(source, tabId, options.readyTimeout || 15000);
+    if (!ready) {
+      throw new Error(`Content script on ${source} did not become ready after navigation`);
+    }
 
     return tabId;
   }
@@ -205,10 +347,20 @@ async function reuseOrCreateTab(source, url, options = {}) {
       };
       chrome.tabs.onUpdated.addListener(listener);
     });
+    // Inject utils.js first, then vps-panel.js — separate calls ensure sequential execution
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      files: options.inject,
+      files: ['content/utils.js'],
     });
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ['content/vps-panel.js'],
+    });
+  }
+
+  const ready = await waitForContentScriptReady(source, tab.id, options.readyTimeout || 15000);
+  if (!ready) {
+    throw new Error(`Content script on ${source} did not become ready after tab creation`);
   }
 
   return tab.id;
@@ -271,6 +423,20 @@ async function setStepStatus(step, status) {
   }).catch(() => {});
 }
 
+function getRandomDelay(minMs, maxMs = minMs) {
+  const lower = Math.max(0, Math.min(minMs, maxMs));
+  const upper = Math.max(minMs, maxMs);
+  return lower + Math.floor(Math.random() * (upper - lower + 1));
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function sleepRandom(minMs, maxMs = minMs) {
+  return new Promise(resolve => setTimeout(resolve, getRandomDelay(minMs, maxMs)));
+}
+
 // ============================================================
 // Message Handler (central router)
 // ============================================================
@@ -315,6 +481,18 @@ async function handleMessage(message, sender) {
     }
 
     case 'STEP_ERROR': {
+      const isMailPollTransient = (message.step === 4 || message.step === 7)
+        && /^mail-/.test(message.source || '')
+        && /No matching email found/i.test(message.error || '');
+
+      if (isMailPollTransient) {
+        await addLog(
+          `Step ${message.step} transient poll timeout from ${message.source}: ${message.error} (will continue retry/resend cycle)`,
+          'warn'
+        );
+        return { ok: true };
+      }
+
       await setStepStatus(message.step, 'failed');
       await addLog(`Step ${message.step} failed: ${message.error}`, 'error');
       notifyStepError(message.step, message.error);
@@ -337,6 +515,9 @@ async function handleMessage(message, sender) {
       if (message.payload.email) {
         await setState({ email: message.payload.email });
       }
+      if (message.payload.emailPrefix !== undefined) {
+        await setState({ emailPrefix: message.payload.emailPrefix });
+      }
       await executeStep(step);
       return { ok: true };
     }
@@ -355,10 +536,16 @@ async function handleMessage(message, sender) {
       return { ok: true };
     }
 
+    case 'RESUME_MANUAL_INTERVENTION': {
+      await resumeManualIntervention();
+      return { ok: true };
+    }
+
     case 'SAVE_SETTING': {
       const updates = {};
       if (message.payload.vpsUrl !== undefined) updates.vpsUrl = message.payload.vpsUrl;
       if (message.payload.mailProvider !== undefined) updates.mailProvider = message.payload.mailProvider;
+      if (message.payload.emailPrefix !== undefined) updates.emailPrefix = message.payload.emailPrefix;
       await setState(updates);
       return { ok: true };
     }
@@ -440,6 +627,16 @@ function notifyStepError(step, error) {
   if (waiter) waiter.reject(new Error(error));
 }
 
+function makeRunRestartError(message) {
+  const err = new Error(message);
+  err.code = 'RUN_RESTART';
+  return err;
+}
+
+function isRunRestartError(err) {
+  return err?.code === 'RUN_RESTART';
+}
+
 // ============================================================
 // Step Execution
 // ============================================================
@@ -473,22 +670,109 @@ async function executeStep(step) {
   } catch (err) {
     await setStepStatus(step, 'failed');
     await addLog(`Step ${step} failed: ${err.message}`, 'error');
+    notifyStepError(step, err.message);
+    throw err;
   }
 }
 
 /**
  * Execute a step and wait for it to complete before returning.
  * @param {number} step
- * @param {number} delayAfter - ms to wait after completion (for page transitions)
+ * @param {number} minDelayAfter - min ms to wait after completion (for page transitions)
+ * @param {number} maxDelayAfter - max ms to wait after completion (for page transitions)
  */
-async function executeStepAndWait(step, delayAfter = 2000) {
-  const promise = waitForStepComplete(step, 120000);
+async function executeStepAndWait(step, minDelayAfter = 2000, maxDelayAfter = minDelayAfter, timeoutMs = 120000) {
+  const promise = waitForStepComplete(step, timeoutMs);
   await executeStep(step);
   await promise;
   // Extra delay for page transitions / DOM updates
-  if (delayAfter > 0) {
-    await new Promise(r => setTimeout(r, delayAfter));
+  if (maxDelayAfter > 0) {
+    await sleepRandom(minDelayAfter, maxDelayAfter);
   }
+}
+
+async function isSignupProfilePageReady() {
+  const signupTabId = await getTabId('signup-page');
+  if (!signupTabId) return false;
+
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId: signupTabId },
+    func: () => {
+      const hasNameInput = !!document.querySelector(
+        'input[name="name"], input[autocomplete="name"], input[placeholder*="全名"]'
+      );
+      const hasCodeInput = !!document.querySelector(
+        'input[name="code"], input[name="otp"], input[maxlength="1"], input[inputmode="numeric"]'
+      );
+      const bodyText = (document.body?.innerText || '').toLowerCase();
+      const hasCodeError = /invalid|incorrect|wrong\s*code|验证码|无效|错误|try again|重新发送/.test(bodyText);
+      return {
+        hasNameInput,
+        hasCodeInput,
+        hasCodeError,
+        href: location.href,
+      };
+    },
+  });
+
+  const info = result?.result;
+  if (!info) return false;
+  if (info.hasNameInput) return true;
+  if (info.hasCodeInput || info.hasCodeError) return false;
+  return false;
+}
+
+async function isOAuthConsentPageReady() {
+  const signupTabId = await getTabId('signup-page');
+  if (!signupTabId) return false;
+
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId: signupTabId },
+    func: () => {
+      const continueBtn = document.querySelector(
+        'button[data-dd-action-name="Continue"][type="submit"], button._primary_3rdp0_107[type="submit"], button[type="submit"]'
+      );
+      const hasContinueText = /(^|\s)(继续|continue)(\s|$)/i.test(
+        (continueBtn?.textContent || document.body?.innerText || '').replace(/\s+/g, ' ')
+      );
+      const hasCodeInput = !!document.querySelector(
+        'input[name="code"], input[name="otp"], input[maxlength="1"], input[inputmode="numeric"]'
+      );
+      const bodyText = (document.body?.innerText || '').toLowerCase();
+      const hasCodeError = /invalid|incorrect|wrong\s*code|验证码|无效|错误|try again|重新发送/.test(bodyText);
+      return {
+        hasContinueButton: !!continueBtn,
+        hasContinueText,
+        hasCodeInput,
+        hasCodeError,
+        href: location.href,
+      };
+    },
+  });
+
+  const info = result?.result;
+  if (!info) return false;
+  if ((info.hasContinueButton && info.hasContinueText) || info.hasContinueButton) return true;
+  if (info.hasCodeInput || info.hasCodeError) return false;
+  return false;
+}
+
+async function waitForSignupProfilePageReady(timeoutMs = 20000, intervalMs = 1000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await isSignupProfilePageReady()) return true;
+    await sleepRandom(intervalMs, intervalMs + 300);
+  }
+  return await isSignupProfilePageReady();
+}
+
+async function waitForOAuthConsentPageReady(timeoutMs = 20000, intervalMs = 1000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await isOAuthConsentPageReady()) return true;
+    await sleepRandom(intervalMs, intervalMs + 300);
+  }
+  return await isOAuthConsentPageReady();
 }
 
 // ============================================================
@@ -498,6 +782,57 @@ async function executeStepAndWait(step, delayAfter = 2000) {
 let autoRunActive = false;
 let autoRunCurrentRun = 0;
 let autoRunTotalRuns = 1;
+let manualInterventionResolver = null;
+
+function waitForManualIntervention() {
+  return new Promise((resolve) => {
+    manualInterventionResolver = resolve;
+  });
+}
+
+async function resumeManualIntervention() {
+  if (manualInterventionResolver) {
+    manualInterventionResolver();
+    manualInterventionResolver = null;
+  }
+}
+
+async function requestManualIntervention(step, message, currentRun, totalRuns) {
+  const payload = { step, message, currentRun, totalRuns };
+  await setState({ manualIntervention: payload });
+  await addLog(`Step ${step}: 需要人工介入。${message}。处理完成后点击侧边栏“人工处理完成，继续下一步”。`, 'warn');
+  chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'manual_intervention', ...payload } }).catch(() => {});
+
+  await waitForManualIntervention();
+
+  await setState({ manualIntervention: null });
+  if (step >= 1 && step <= 9) {
+    await setStepStatus(step, 'completed');
+    await addLog(`Step ${step}: 人工处理后已继续下一步`, 'ok');
+  }
+  chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'running', currentRun, totalRuns } }).catch(() => {});
+}
+
+async function executeStepWithManualFallback(step, currentRun, totalRuns, minDelayAfter, maxDelayAfter, timeoutMs = 120000) {
+  try {
+    await executeStepAndWait(step, minDelayAfter, maxDelayAfter, timeoutMs);
+  } catch (err) {
+    if (isRunRestartError(err)) {
+      throw err;
+    }
+    await requestManualIntervention(step, err.message, currentRun, totalRuns);
+  }
+}
+
+async function executeStepWithRunRestartFallback(step, currentRun, totalRuns, minDelayAfter, maxDelayAfter, timeoutMs = 120000) {
+  try {
+    await executeStepAndWait(step, minDelayAfter, maxDelayAfter, timeoutMs);
+  } catch (err) {
+    throw makeRunRestartError(
+      `Step ${step} failed and requires a fresh run restart: ${err.message}`
+    );
+  }
+}
 
 // Outer loop: runs the full flow N times
 async function autoRunLoop(totalRuns) {
@@ -510,6 +845,8 @@ async function autoRunLoop(totalRuns) {
   autoRunTotalRuns = totalRuns;
   await setState({ autoRunning: true });
 
+  const runRestartCounts = new Map();
+
   for (let run = 1; run <= totalRuns; run++) {
     autoRunCurrentRun = run;
 
@@ -518,13 +855,14 @@ async function autoRunLoop(totalRuns) {
     const keepSettings = {
       vpsUrl: prevState.vpsUrl,
       mailProvider: prevState.mailProvider,
+      emailPrefix: prevState.emailPrefix || '',
       autoRunning: true,
     };
     await resetState();
     await setState(keepSettings);
     // Tell side panel to reset all UI
     chrome.runtime.sendMessage({ type: 'AUTO_RUN_RESET' }).catch(() => {});
-    await new Promise(r => setTimeout(r, 500));
+    await sleepRandom(400, 900);
 
     await addLog(`=== Auto Run ${run}/${totalRuns} — Phase 1: Get OAuth link & open signup ===`, 'info');
     const status = (phase) => ({ type: 'AUTO_RUN_STATUS', payload: { phase, currentRun: run, totalRuns } });
@@ -532,36 +870,92 @@ async function autoRunLoop(totalRuns) {
     try {
       chrome.runtime.sendMessage(status('running')).catch(() => {});
 
-      await executeStepAndWait(1, 2000);
-      await executeStepAndWait(2, 2000);
+      await executeStepWithManualFallback(1, run, totalRuns, 2600, 3800);
+      await executeStepWithManualFallback(2, run, totalRuns, 2600, 3800);
 
-      // Pause for email
-      await addLog(`=== Run ${run}/${totalRuns} PAUSED: Paste DuckDuckGo email, click Continue ===`, 'warn');
-      chrome.runtime.sendMessage(status('waiting_email')).catch(() => {});
 
-      // Wait for RESUME_AUTO_RUN — sets a promise that resumeAutoRun resolves
-      await waitForResume();
-
-      const state = await getState();
-      if (!state.email) {
-        await addLog('Cannot resume: no email address.', 'error');
-        break;
+      // 2925 模式跳过暂停，其余等待用户粘贴邮箱
+      const runState = await getState();
+      if (runState.mailProvider === '2925') {
+        if (!runState.emailPrefix) {
+          await addLog('Cannot continue: 2925 邮箱前缀未设置，请在侧边栏填写。', 'error');
+          chrome.runtime.sendMessage(status('stopped')).catch(() => {});
+          break;
+        }
+        await addLog(`=== Run ${run}/${totalRuns} — 2925 模式，将在步骤3自动生成邮箱 ===`, 'info');
+      } else {
+        // Pause for email
+        await addLog(`=== Run ${run}/${totalRuns} PAUSED: Paste DuckDuckGo email, click Continue ===`, 'warn');
+        chrome.runtime.sendMessage(status('waiting_email')).catch(() => {});
+        // Wait for RESUME_AUTO_RUN — sets a promise that resumeAutoRun resolves
+        await waitForResume();
+        const resumedState = await getState();
+        if (!resumedState.email) {
+          await addLog('Cannot resume: no email address.', 'error');
+          break;
+        }
       }
 
       await addLog(`=== Run ${run}/${totalRuns} — Phase 2: Register, verify, login, complete ===`, 'info');
       chrome.runtime.sendMessage(status('running')).catch(() => {});
 
-      await executeStepAndWait(3, 3000);
-      await executeStepAndWait(4, 2000);
-      await executeStepAndWait(5, 3000);
-      await executeStepAndWait(6, 3000);
-      await executeStepAndWait(7, 2000);
-      await executeStepAndWait(8, 2000);
-      await executeStepAndWait(9, 1000);
+      await executeStepWithManualFallback(3, run, totalRuns, 3200, 4800);
+      await executeStepWithManualFallback(4, run, totalRuns, 3200, 4800, 600000);
+
+      // Guard: if step 4 used an old/invalid code, the page may still be on verification input.
+      // Retry step 4 instead of moving to step 5 and failing downstream.
+      let profileReady = await waitForSignupProfilePageReady(20000, 1200);
+      for (let retry = 1; !profileReady && retry <= 2; retry++) {
+        await addLog(`Step 4 guard: still not on profile page after code submit, retrying step 4 (${retry}/2)...`, 'warn');
+        await executeStepWithManualFallback(4, run, totalRuns, 3200, 4800, 600000);
+        profileReady = await waitForSignupProfilePageReady(20000, 1200);
+      }
+      if (!profileReady) {
+        await requestManualIntervention(4, '仍未进入姓名/生日页面，请人工确认注册验证码页面并处理，然后继续。', run, totalRuns);
+      }
+
+      await executeStepWithManualFallback(5, run, totalRuns, 3200, 4800);
+      await executeStepWithManualFallback(6, run, totalRuns, 3200, 4800);
+      await executeStepWithManualFallback(7, run, totalRuns, 3200, 4800, 600000);
+
+      // Guard: step 7 may submit a stale/invalid login code and still report completion.
+      // Ensure we actually reached OAuth consent page before moving to step 8.
+      let consentReady = await waitForOAuthConsentPageReady(20000, 1200);
+      for (let retry = 1; !consentReady && retry <= 2; retry++) {
+        await addLog(`Step 7 guard: consent page not ready after code submit, retrying step 7 (${retry}/2)...`, 'warn');
+        await executeStepWithManualFallback(7, run, totalRuns, 3200, 4800, 600000);
+        consentReady = await waitForOAuthConsentPageReady(20000, 1200);
+      }
+      if (!consentReady) {
+        await requestManualIntervention(7, '仍未进入 OAuth 同意页，请人工确认登录验证码页面并处理，然后继续。', run, totalRuns);
+      }
+
+      await executeStepWithRunRestartFallback(8, run, totalRuns, 2400, 3600);
+      await executeStepWithManualFallback(9, run, totalRuns, 1600, 2600);
 
       await addLog(`=== Run ${run}/${totalRuns} COMPLETE! ===`, 'ok');
 
     } catch (err) {
+      if (isRunRestartError(err)) {
+        const restartCount = (runRestartCounts.get(run) || 0) + 1;
+        runRestartCounts.set(run, restartCount);
+
+        if (restartCount <= MAX_RESTARTS_PER_RUN) {
+          await addLog(
+            `Run ${run}/${totalRuns} 命中需重开错误，正在重启本轮 (${restartCount}/${MAX_RESTARTS_PER_RUN})：${err.message}`,
+            'warn'
+          );
+          chrome.runtime.sendMessage(status('running')).catch(() => {});
+          run -= 1;
+          continue;
+        }
+
+        await addLog(
+          `Run ${run}/${totalRuns} 已达到本轮重启上限 (${MAX_RESTARTS_PER_RUN})：${err.message}`,
+          'error'
+        );
+      }
+
       await addLog(`Run ${run}/${totalRuns} failed: ${err.message}`, 'error');
       chrome.runtime.sendMessage(status('stopped')).catch(() => {});
       break; // Stop on error
@@ -606,10 +1000,69 @@ async function resumeAutoRun() {
 
 async function executeStep1(state) {
   if (!state.vpsUrl) {
-    throw new Error('No VPS URL configured. Enter VPS address in Side Panel first.');
+    const local = await buildLocalOAuthUrl();
+    await setState({
+      oauthUrl: local.oauthUrl,
+      oauthCodeVerifier: local.codeVerifier,
+      oauthState: local.state,
+    });
+    await addLog('Step 1: CPA 接口为空，已本地生成 OAuth 链接。', 'ok');
+    chrome.runtime.sendMessage({
+      type: 'DATA_UPDATED',
+      payload: { oauthUrl: local.oauthUrl },
+    }).catch(() => {});
+    await setStepStatus(1, 'completed');
+    notifyStepComplete(1, { oauthUrl: local.oauthUrl, mode: 'local' });
+    return;
   }
-  await addLog(`Step 1: Opening VPS panel...`);
-  await reuseOrCreateTab('vps-panel', state.vpsUrl, { inject: ['content/utils.js', 'content/vps-panel.js'] });
+
+  await addLog('Step 1: Opening VPS panel in a fresh tab...');
+
+  // Always open a fresh tab — reusing/reloading an existing tab leaves stale
+  // content-script state that causes "sleep is not defined" errors.
+  const existingTabId = await getTabId('vps-panel');
+  if (existingTabId) {
+    try { await chrome.tabs.remove(existingTabId); } catch (_) {}
+  }
+
+  // Create new tab
+  const tab = await chrome.tabs.create({ url: state.vpsUrl, active: true });
+  await addLog('Step 1: Created new VPS panel tab (id=' + tab.id + ')');
+
+  // Update registry with new tab id
+  const registry = await getTabRegistry();
+  registry['vps-panel'] = { id: tab.id, ready: false, url: state.vpsUrl };
+  await setState({ tabRegistry: registry });
+
+  // Wait for page load
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 5000);
+    const listener = (tabId, info) => {
+      if (tabId === tab.id && info.status === 'complete') {
+        chrome.tabs.onUpdated.removeListener(listener);
+        clearTimeout(timer);
+        resolve();
+      }
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+
+  // Inject utils.js first (must be ready before vps-panel.js runs), then vps-panel.js
+  await addLog('Step 1: Injecting content scripts...');
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    files: ['content/utils.js'],
+  });
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    files: ['content/vps-panel.js'],
+  });
+
+  const tabReady = await waitForContentScriptReady('vps-panel', tab.id, 15000);
+  if (!tabReady) {
+    throw new Error('Content script on VPS panel did not become ready');
+  }
+  await addLog('Step 1: Content script ready.', 'ok');
 
   await sendToContentScript('vps-panel', {
     type: 'EXECUTE_STEP',
@@ -642,9 +1095,32 @@ async function executeStep2(state) {
 // Step 3: Fill Email & Password (via signup-page.js)
 // ============================================================
 
+function generateRandomSuffix(length = 6) {
+  const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+  let s = '';
+  for (let i = 0; i < length; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
+}
+
 async function executeStep3(state) {
-  if (!state.email) {
-    throw new Error('No email address. Paste email in Side Panel first.');
+  let email = state.email;
+
+  // 2925 模式：用前缀 + 随机后缀 + @2925.com 自动生成邮箱
+  if (state.mailProvider === '2925') {
+    if (!state.emailPrefix) {
+      throw new Error('2925 邮箱前缀未设置，请在侧边栏填写。');
+    }
+    email = `${state.emailPrefix}${generateRandomSuffix(6)}@2925.com`;
+    await setState({ email });
+    await addLog(`Step 3: 2925 邮箱已生成: ${email}`);
+    chrome.runtime.sendMessage({
+      type: 'DATA_UPDATED',
+      payload: { generatedEmail: email },
+    }).catch(() => {});
+  } else {
+    if (!email) {
+      throw new Error('No email address. Paste email in Side Panel first.');
+    }
   }
 
   // Generate a unique password for this account
@@ -653,15 +1129,15 @@ async function executeStep3(state) {
 
   // Save account record
   const accounts = state.accounts || [];
-  accounts.push({ email: state.email, password, createdAt: new Date().toISOString() });
+  accounts.push({ email, password, createdAt: new Date().toISOString() });
   await setState({ accounts });
 
-  await addLog(`Step 3: Filling email ${state.email}, password generated (${password.length} chars)`);
+  await addLog(`Step 3: Filling email ${email}, password generated (${password.length} chars)`);
   await sendToContentScript('signup-page', {
     type: 'EXECUTE_STEP',
     step: 3,
     source: 'background',
-    payload: { email: state.email, password },
+    payload: { email, password },
   });
 }
 
@@ -673,6 +1149,9 @@ function getMailConfig(state) {
   const provider = state.mailProvider || 'qq';
   if (provider === '163') {
     return { source: 'mail-163', url: 'https://mail.163.com/js6/main.jsp?df=mail163_letter#module=mbox.ListModule%7C%7B%22fid%22%3A1%2C%22order%22%3A%22date%22%2C%22desc%22%3Atrue%7D', label: '163 Mail' };
+  }
+  if (provider === '2925') {
+    return { source: 'mail-2925', url: 'https://2925.com/#/mailList', label: '2925 Mail' };
   }
   return { source: 'qq-mail', url: 'https://wx.mail.qq.com/', label: 'QQ Mail' };
 }
@@ -690,30 +1169,36 @@ async function executeStep4(state) {
     await reuseOrCreateTab(mail.source, mail.url);
   }
 
-  const result = await sendToContentScript(mail.source, {
-    type: 'POLL_EMAIL',
-    step: 4,
-    source: 'background',
-    payload: {
-      filterAfterTimestamp: state.flowStartTime || 0,
-      senderFilters: ['openai', 'noreply', 'verify', 'auth'],
-      subjectFilters: ['verify', 'verification', 'code', '验证', 'confirm'],
-      maxAttempts: 20,
-      intervalMs: 3000,
-    },
-  });
+  let cycle = 1;
+  while (true) {
+    const cycleStartedAt = Date.now();
+    await addLog(`Step 4: Polling signup verification code, cycle ${cycle}...`);
 
-  if (result && result.error) {
-    throw new Error(result.error);
-  }
+    const result = await sendToContentScript(mail.source, {
+      type: 'POLL_EMAIL',
+      step: 4,
+      source: 'background',
+      payload: {
+        filterAfterTimestamp: cycleStartedAt,
+        senderFilters: ['openai', 'noreply', 'verify', 'auth'],
+        subjectFilters: ['verify', 'verification', 'code', '验证', 'confirm'],
+        maxAttempts: 20,
+        intervalMs: 3000,
+      },
+    });
 
-  if (result && result.code) {
-    await setState({ lastEmailTimestamp: result.emailTimestamp });
-    await addLog(`Step 4: Got verification code: ${result.code}`);
+    if (result && result.code) {
+      await setState({
+        lastEmailTimestamp: result.emailTimestamp,
+        signupVerificationCode: result.code,
+      });
+      await addLog(`Step 4: Got verification code: ${result.code}`);
 
-    // Switch to signup tab and fill code
-    const signupTabId = await getTabId('signup-page');
-    if (signupTabId) {
+      const signupTabId = await getTabId('signup-page');
+      if (!signupTabId) {
+        throw new Error('Signup page tab was closed. Cannot fill verification code.');
+      }
+
       await chrome.tabs.update(signupTabId, { active: true });
       await sendToContentScript('signup-page', {
         type: 'FILL_CODE',
@@ -721,9 +1206,31 @@ async function executeStep4(state) {
         source: 'background',
         payload: { code: result.code },
       });
-    } else {
-      throw new Error('Signup page tab was closed. Cannot fill verification code.');
+      return;
     }
+
+    await addLog(`Step 4: No signup code found in cycle ${cycle}, requesting resend email...`, 'warn');
+
+    const signupTabId = await getTabId('signup-page');
+    if (!signupTabId) {
+      throw new Error('Signup page tab was closed. Cannot click resend verification email.');
+    }
+
+    await chrome.tabs.update(signupTabId, { active: true });
+    await sendToContentScript('signup-page', {
+      type: 'EXECUTE_STEP',
+      step: 41,
+      source: 'background',
+      payload: {},
+    });
+    await addLog(`Step 4: Resend verification email clicked for cycle ${cycle}`, 'info');
+    await sleepRandom(1800, 3200);
+
+    const mailTabId = await getTabId(mail.source);
+    if (mailTabId) {
+      await chrome.tabs.update(mailTabId, { active: true });
+    }
+    cycle += 1;
   }
 }
 
@@ -786,29 +1293,34 @@ async function executeStep7(state) {
     await reuseOrCreateTab(mail.source, mail.url);
   }
 
-  const result = await sendToContentScript(mail.source, {
-    type: 'POLL_EMAIL',
-    step: 7,
-    source: 'background',
-    payload: {
-      filterAfterTimestamp: state.lastEmailTimestamp || state.flowStartTime || 0,
-      senderFilters: ['openai', 'noreply', 'verify', 'auth', 'chatgpt'],
-      subjectFilters: ['verify', 'verification', 'code', '验证', 'confirm', 'login'],
-      maxAttempts: 20,
-      intervalMs: 3000,
-    },
-  });
+  let cycle = 1;
+  while (true) {
+    const cycleStartedAt = Date.now();
+    await addLog(`Step 7: Polling login verification code, cycle ${cycle}...`);
 
-  if (result && result.error) {
-    throw new Error(result.error);
-  }
+    const result = await sendToContentScript(mail.source, {
+      type: 'POLL_EMAIL',
+      step: 7,
+      source: 'background',
+      payload: {
+        filterAfterTimestamp: cycleStartedAt,
+        strictChatGPTCodeOnly: true,
+        excludeCodes: state.signupVerificationCode ? [state.signupVerificationCode] : [],
+        senderFilters: ['openai', 'noreply', 'verify', 'auth', 'chatgpt'],
+        subjectFilters: ['your chatgpt code is'],
+        maxAttempts: 20,
+        intervalMs: 3000,
+      },
+    });
 
-  if (result && result.code) {
-    await addLog(`Step 7: Got login verification code: ${result.code}`);
+    if (result && result.code) {
+      await addLog(`Step 7: Got login verification code: ${result.code}`);
 
-    // Switch to signup/auth tab and fill code
-    const signupTabId = await getTabId('signup-page');
-    if (signupTabId) {
+      const signupTabId = await getTabId('signup-page');
+      if (!signupTabId) {
+        throw new Error('Auth page tab was closed. Cannot fill verification code.');
+      }
+
       await chrome.tabs.update(signupTabId, { active: true });
       await sendToContentScript('signup-page', {
         type: 'FILL_CODE',
@@ -816,9 +1328,31 @@ async function executeStep7(state) {
         source: 'background',
         payload: { code: result.code },
       });
-    } else {
-      throw new Error('Auth page tab was closed. Cannot fill verification code.');
+      return;
     }
+
+    await addLog(`Step 7: No login code found in cycle ${cycle}, requesting resend email...`, 'warn');
+
+    const signupTabId = await getTabId('signup-page');
+    if (!signupTabId) {
+      throw new Error('Auth page tab was closed. Cannot click resend verification email.');
+    }
+
+    await chrome.tabs.update(signupTabId, { active: true });
+    await sendToContentScript('signup-page', {
+      type: 'EXECUTE_STEP',
+      step: 71,
+      source: 'background',
+      payload: {},
+    });
+    await addLog(`Step 7: Resend verification email clicked for cycle ${cycle}`, 'info');
+    await sleepRandom(1800, 3200);
+
+    const mailTabId = await getTabId(mail.source);
+    if (mailTabId) {
+      await chrome.tabs.update(mailTabId, { active: true });
+    }
+    cycle += 1;
   }
 }
 
@@ -827,6 +1361,35 @@ async function executeStep7(state) {
 // ============================================================
 
 let webNavListener = null;
+
+async function inspectSignupPageForOAuthFailure(tabId) {
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+        const compactText = bodyText.toLowerCase();
+        const invalidState = /invalid_state/i.test(bodyText);
+        const hasOAuthErrorText = /验证过程中出错|糟糕[，,]?\s*出错了|something went wrong|an error occurred/i.test(bodyText);
+        const hasRetryButton = /(^|\s)(重试|retry)(\s|$)/i.test(bodyText);
+        return {
+          href: location.href,
+          invalidState,
+          hasOAuthErrorText,
+          hasRetryButton,
+          bodyText: bodyText.slice(0, 500),
+          title: document.title || '',
+          readyState: document.readyState,
+          stillOnConsent: /\/consent(?:$|[/?#])/.test(location.pathname),
+        };
+      },
+    });
+
+    return result?.result || null;
+  } catch {
+    return null;
+  }
+}
 
 async function executeStep8(state) {
   if (!state.oauthUrl) {
@@ -837,22 +1400,38 @@ async function executeStep8(state) {
 
   // Register webNavigation listener (scoped to this step)
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
+    let settled = false;
+    let monitorTimer = null;
+
+    const cleanup = () => {
       if (webNavListener) {
         chrome.webNavigation.onBeforeNavigate.removeListener(webNavListener);
         webNavListener = null;
       }
-      setStepStatus(8, 'failed');
-      addLog('Step 8: Localhost redirect not captured after 30s. Check if OAuth authorization completed.', 'error');
+      if (monitorTimer) {
+        clearTimeout(monitorTimer);
+        monitorTimer = null;
+      }
+      clearTimeout(timeout);
+    };
+
+    const timeout = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
       reject(new Error('Localhost redirect not captured after 30s. Check if OAuth authorization completed.'));
     }, 30000);
 
     webNavListener = (details) => {
+      if (settled) {
+        return;
+      }
       if (details.url.startsWith('http://localhost')) {
         console.log(LOG_PREFIX, `Captured localhost redirect: ${details.url}`);
-        chrome.webNavigation.onBeforeNavigate.removeListener(webNavListener);
-        webNavListener = null;
-        clearTimeout(timeout);
+        settled = true;
+        cleanup();
 
         setState({ localhostUrl: details.url }).then(() => {
           addLog(`Step 8: Captured localhost URL: ${details.url}`, 'ok');
@@ -868,6 +1447,31 @@ async function executeStep8(state) {
     };
 
     chrome.webNavigation.onBeforeNavigate.addListener(webNavListener);
+
+    const monitorForOAuthFailure = async () => {
+      if (settled) {
+        return;
+      }
+
+      const signupTabId = await getTabId('signup-page');
+      if (signupTabId) {
+        const info = await inspectSignupPageForOAuthFailure(signupTabId);
+        if (info?.invalidState) {
+          settled = true;
+          cleanup();
+          reject(new Error(`OAuth consent failed with invalid_state. Current URL: ${info.href}`));
+          return;
+        }
+        if (info?.hasOAuthErrorText && info?.hasRetryButton) {
+          settled = true;
+          cleanup();
+          reject(new Error(`OAuth consent page returned an error. Current URL: ${info.href}`));
+          return;
+        }
+      }
+
+      monitorTimer = setTimeout(monitorForOAuthFailure, 800);
+    };
 
     // After step 7, the auth page shows a consent screen ("使用 ChatGPT 登录到 Codex")
     // with a "继续" button. We need to click it, which triggers the localhost redirect.
@@ -893,11 +1497,11 @@ async function executeStep8(state) {
             payload: {},
           });
         }
+        monitorTimer = setTimeout(monitorForOAuthFailure, 800);
       } catch (err) {
-        clearTimeout(timeout);
-        if (webNavListener) {
-          chrome.webNavigation.onBeforeNavigate.removeListener(webNavListener);
-          webNavListener = null;
+        if (!settled) {
+          settled = true;
+          cleanup();
         }
         reject(err);
       }
@@ -909,12 +1513,58 @@ async function executeStep8(state) {
 // Step 9: VPS Verify (via vps-panel.js)
 // ============================================================
 
+function makeTimestampForFile() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${yyyy}${mm}${dd}-${hh}${mi}${ss}`;
+}
+
+async function downloadAuthResultFile(state) {
+  const callback = parseCallbackFromUrl(state.localhostUrl || '');
+  if (!callback || !callback.code) {
+    throw new Error('回调 URL 无法解析出 code，无法本地换取 token。');
+  }
+  if (callback.error) {
+    throw new Error(`授权回调返回错误: ${callback.error}`);
+  }
+  if (!state.oauthCodeVerifier) {
+    throw new Error('缺少 PKCE code_verifier，请重新从第1步开始。');
+  }
+  if (state.oauthState && callback.state !== state.oauthState) {
+    throw new Error('回调 state 与本地记录不匹配，请重新开始流程。');
+  }
+
+  await addLog('Step 9: 正在本地换取 token...', 'info');
+  const tokens = await exchangeTokenWithOpenAI(callback.code, state.oauthCodeVerifier);
+  const payload = buildCodexTokenFile(tokens);
+  const filename = `token_${Date.now()}.json`;
+  const content = JSON.stringify(payload, null, 2);
+  const dataUrl = `data:application/json;charset=utf-8,${encodeURIComponent(content)}`;
+
+  await chrome.downloads.download({
+    url: dataUrl,
+    filename,
+    saveAs: false,
+  });
+
+  await addLog(`Step 9: 本地换取成功，已下载 ${filename}`, 'ok');
+}
+
 async function executeStep9(state) {
   if (!state.localhostUrl) {
     throw new Error('No localhost URL. Complete step 8 first.');
   }
   if (!state.vpsUrl) {
-    throw new Error('VPS URL not set. Please enter VPS URL in the side panel.');
+    await addLog('Step 9: 未填写 CPA 接口地址，切换为本地下载结果文件模式。', 'warn');
+    await downloadAuthResultFile(state);
+    await setStepStatus(9, 'completed');
+    notifyStepComplete(9, { mode: 'download' });
+    return;
   }
 
   await addLog('Step 9: Opening VPS panel...');

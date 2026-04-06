@@ -356,6 +356,19 @@ header {
 .auto-continue-bar svg { color: var(--orange); flex-shrink: 0; }
 .auto-hint { font-size: 13px; color: var(--orange); flex: 1; font-weight: 500; }
 
+.manual-intervention-bar {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: var(--red-soft);
+  border: 1px solid rgba(220, 38, 38, 0.2);
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.manual-intervention-bar svg { color: var(--red); flex-shrink: 0; }
+.manual-hint { font-size: 13px; color: var(--red); flex: 1; font-weight: 500; }
+
 /* ============================================================
    Steps Section
    ============================================================ */

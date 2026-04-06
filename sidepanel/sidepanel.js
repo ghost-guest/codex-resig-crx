@@ -18,10 +18,16 @@ const stepsProgress = document.getElementById('steps-progress');
 const btnAutoRun = document.getElementById('btn-auto-run');
 const btnAutoContinue = document.getElementById('btn-auto-continue');
 const autoContinueBar = document.getElementById('auto-continue-bar');
+const manualInterventionBar = document.getElementById('manual-intervention-bar');
+const manualInterventionText = document.getElementById('manual-intervention-text');
+const btnManualContinue = document.getElementById('btn-manual-continue');
 const btnClearLog = document.getElementById('btn-clear-log');
 const inputVpsUrl = document.getElementById('input-vps-url');
 const selectMailProvider = document.getElementById('select-mail-provider');
 const inputRunCount = document.getElementById('input-run-count');
+const inputEmailPrefix = document.getElementById('input-email-prefix');
+const rowEmailPrefix = document.getElementById('row-email-prefix');
+const rowEmail = document.getElementById('row-email');
 
 // ============================================================
 // Toast Notifications
@@ -79,6 +85,13 @@ async function restoreState() {
     }
     if (state.mailProvider) {
       selectMailProvider.value = state.mailProvider;
+      if (state.mailProvider === '2925') {
+        rowEmailPrefix.style.display = '';
+        rowEmail.style.display = 'none';
+      }
+    }
+    if (state.emailPrefix) {
+      inputEmailPrefix.value = state.emailPrefix;
     }
 
     if (state.stepStatuses) {
@@ -91,6 +104,12 @@ async function restoreState() {
       for (const entry of state.logs) {
         appendLog(entry);
       }
+    }
+
+    if (state.manualIntervention) {
+      const { step, message } = state.manualIntervention;
+      manualInterventionText.textContent = `步骤 ${step} 需要人工介入：${message}`;
+      manualInterventionBar.style.display = 'flex';
     }
 
     updateStatusDisplay(state);
@@ -160,14 +179,14 @@ function updateStatusDisplay(state) {
 
   const running = Object.entries(state.stepStatuses).find(([, s]) => s === 'running');
   if (running) {
-    displayStatus.textContent = `Step ${running[0]} running...`;
+    displayStatus.textContent = `步骤 ${running[0]} 执行中...`;
     statusBar.classList.add('running');
     return;
   }
 
   const failed = Object.entries(state.stepStatuses).find(([, s]) => s === 'failed');
   if (failed) {
-    displayStatus.textContent = `Step ${failed[0]} failed`;
+    displayStatus.textContent = `步骤 ${failed[0]} 失败`;
     statusBar.classList.add('failed');
     return;
   }
@@ -178,22 +197,22 @@ function updateStatusDisplay(state) {
     .sort((a, b) => b - a)[0];
 
   if (lastCompleted === 9) {
-    displayStatus.textContent = 'All steps completed!';
+    displayStatus.textContent = '全部步骤已完成!';
     statusBar.classList.add('completed');
   } else if (lastCompleted) {
-    displayStatus.textContent = `Step ${lastCompleted} done`;
+    displayStatus.textContent = `步骤 ${lastCompleted} 已完成`;
   } else {
-    displayStatus.textContent = 'Ready';
+    displayStatus.textContent = '就绪';
   }
 }
 
 function appendLog(entry) {
-  const time = new Date(entry.timestamp).toLocaleTimeString('en-US', { hour12: false });
+  const time = new Date(entry.timestamp).toLocaleTimeString('zh-CN', { hour12: false });
   const levelLabel = entry.level.toUpperCase();
   const line = document.createElement('div');
   line.className = `log-line log-${entry.level}`;
 
-  const stepMatch = entry.message.match(/Step (\d)/);
+  const stepMatch = entry.message.match(/(?:Step|步骤)\s*(\d)/);
   const stepNum = stepMatch ? stepMatch[1] : null;
 
   let html = `<span class="log-time">${time}</span> `;
@@ -222,12 +241,21 @@ document.querySelectorAll('.step-btn').forEach(btn => {
   btn.addEventListener('click', async () => {
     const step = Number(btn.dataset.step);
     if (step === 3) {
-      const email = inputEmail.value.trim();
-      if (!email) {
-        showToast('Please paste email address first', 'warn');
-        return;
+      if (selectMailProvider.value === '2925') {
+        const emailPrefix = inputEmailPrefix.value.trim();
+        if (!emailPrefix) {
+          showToast('请先填写 2925 邮箱前缀', 'warn');
+          return;
+        }
+        await chrome.runtime.sendMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step, emailPrefix } });
+      } else {
+        const email = inputEmail.value.trim();
+        if (!email) {
+          showToast('请先粘贴邮箱地址', 'warn');
+          return;
+        }
+        await chrome.runtime.sendMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step, email } });
       }
-      await chrome.runtime.sendMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step, email } });
     } else {
       await chrome.runtime.sendMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step } });
     }
@@ -236,40 +264,62 @@ document.querySelectorAll('.step-btn').forEach(btn => {
 
 // Auto Run
 btnAutoRun.addEventListener('click', async () => {
+  const vpsUrl = inputVpsUrl.value.trim();
+  const mailProvider = selectMailProvider.value;
+  const emailPrefix = inputEmailPrefix.value.trim();
+
+  // Ensure latest panel values are persisted before auto run starts.
+  await chrome.runtime.sendMessage({
+    type: 'SAVE_SETTING',
+    source: 'sidepanel',
+    payload: { vpsUrl, mailProvider, emailPrefix },
+  });
+
   const totalRuns = parseInt(inputRunCount.value) || 1;
   btnAutoRun.disabled = true;
   inputRunCount.disabled = true;
-  btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> Running...';
+  btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> 运行中...';
   await chrome.runtime.sendMessage({ type: 'AUTO_RUN', source: 'sidepanel', payload: { totalRuns } });
 });
 
 btnAutoContinue.addEventListener('click', async () => {
   const email = inputEmail.value.trim();
   if (!email) {
-    showToast('Please paste DuckDuckGo email first!', 'warn');
+    showToast('请先粘贴 DuckDuckGo 邮箱!', 'warn');
     return;
   }
   autoContinueBar.style.display = 'none';
   await chrome.runtime.sendMessage({ type: 'RESUME_AUTO_RUN', source: 'sidepanel', payload: { email } });
 });
 
+btnManualContinue.addEventListener('click', async () => {
+  btnManualContinue.disabled = true;
+  try {
+    await chrome.runtime.sendMessage({ type: 'RESUME_MANUAL_INTERVENTION', source: 'sidepanel', payload: {} });
+    manualInterventionBar.style.display = 'none';
+  } finally {
+    btnManualContinue.disabled = false;
+  }
+});
+
 // Reset
 btnReset.addEventListener('click', async () => {
-  if (confirm('Reset all steps and data?')) {
+  if (confirm('重置全部步骤和数据?')) {
     await chrome.runtime.sendMessage({ type: 'RESET', source: 'sidepanel' });
-    displayOauthUrl.textContent = 'Waiting...';
+    displayOauthUrl.textContent = '等待中...';
     displayOauthUrl.classList.remove('has-value');
-    displayLocalhostUrl.textContent = 'Waiting...';
+    displayLocalhostUrl.textContent = '等待中...';
     displayLocalhostUrl.classList.remove('has-value');
     inputEmail.value = '';
-    displayStatus.textContent = 'Ready';
+    displayStatus.textContent = '就绪';
     statusBar.className = 'status-bar';
     logArea.innerHTML = '';
     document.querySelectorAll('.step-row').forEach(row => row.className = 'step-row');
     document.querySelectorAll('.step-status').forEach(el => el.textContent = '');
     btnAutoRun.disabled = false;
-    btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> Auto';
+    btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> 自动';
     autoContinueBar.style.display = 'none';
+      manualInterventionBar.style.display = 'none';
     updateButtonStates();
     updateProgressCounter();
   }
@@ -296,9 +346,20 @@ inputVpsUrl.addEventListener('change', async () => {
 });
 
 selectMailProvider.addEventListener('change', async () => {
+  const is2925 = selectMailProvider.value === '2925';
+  rowEmailPrefix.style.display = is2925 ? '' : 'none';
+  rowEmail.style.display = is2925 ? 'none' : '';
   await chrome.runtime.sendMessage({
     type: 'SAVE_SETTING', source: 'sidepanel',
     payload: { mailProvider: selectMailProvider.value },
+  });
+});
+
+inputEmailPrefix.addEventListener('change', async () => {
+  const emailPrefix = inputEmailPrefix.value.trim();
+  await chrome.runtime.sendMessage({
+    type: 'SAVE_SETTING', source: 'sidepanel',
+    payload: { emailPrefix },
   });
 });
 
@@ -336,16 +397,18 @@ chrome.runtime.onMessage.addListener((message) => {
 
     case 'AUTO_RUN_RESET': {
       // Full UI reset for next run
-      displayOauthUrl.textContent = 'Waiting...';
+      displayOauthUrl.textContent = '等待中...';
       displayOauthUrl.classList.remove('has-value');
-      displayLocalhostUrl.textContent = 'Waiting...';
+      displayLocalhostUrl.textContent = '等待中...';
       displayLocalhostUrl.classList.remove('has-value');
       inputEmail.value = '';
-      displayStatus.textContent = 'Ready';
+      displayStatus.textContent = '就绪';
       statusBar.className = 'status-bar';
       logArea.innerHTML = '';
       document.querySelectorAll('.step-row').forEach(row => row.className = 'step-row');
       document.querySelectorAll('.step-status').forEach(el => el.textContent = '');
+      autoContinueBar.style.display = 'none';
+      manualInterventionBar.style.display = 'none';
       updateProgressCounter();
       break;
     }
@@ -359,6 +422,9 @@ chrome.runtime.onMessage.addListener((message) => {
         displayLocalhostUrl.textContent = message.payload.localhostUrl;
         displayLocalhostUrl.classList.add('has-value');
       }
+      if (message.payload.generatedEmail) {
+        inputEmail.value = message.payload.generatedEmail;
+      }
       break;
     }
 
@@ -368,22 +434,33 @@ chrome.runtime.onMessage.addListener((message) => {
       switch (phase) {
         case 'waiting_email':
           autoContinueBar.style.display = 'flex';
-          btnAutoRun.innerHTML = `Paused${runLabel}`;
+          manualInterventionBar.style.display = 'none';
+          btnAutoRun.innerHTML = `已暂停${runLabel}`;
+          break;
+        case 'manual_intervention':
+          autoContinueBar.style.display = 'none';
+          manualInterventionText.textContent = `步骤 ${message.payload.step || message.payload?.step || ''} 需要人工介入：${message.payload.message}`;
+          manualInterventionBar.style.display = 'flex';
+          btnAutoRun.innerHTML = `人工介入中${runLabel}`;
           break;
         case 'running':
-          btnAutoRun.innerHTML = `Running${runLabel}`;
+          autoContinueBar.style.display = 'none';
+          manualInterventionBar.style.display = 'none';
+          btnAutoRun.innerHTML = `运行中${runLabel}`;
           break;
         case 'complete':
           btnAutoRun.disabled = false;
           inputRunCount.disabled = false;
-          btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> Auto';
+          btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> 自动';
           autoContinueBar.style.display = 'none';
+          manualInterventionBar.style.display = 'none';
           break;
         case 'stopped':
           btnAutoRun.disabled = false;
           inputRunCount.disabled = false;
-          btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> Auto';
+          btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> 自动';
           autoContinueBar.style.display = 'none';
+          manualInterventionBar.style.display = 'none';
           break;
       }
       break;

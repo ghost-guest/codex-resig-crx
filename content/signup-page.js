@@ -24,6 +24,9 @@ async function handleCommand(message) {
         case 3: return await step3_fillEmailPassword(message.payload);
         case 5: return await step5_fillNameBirthday(message.payload);
         case 6: return await step6_login(message.payload);
+        case 41:
+        case 71:
+          return await stepResendVerificationEmail(message.step);
         case 8: return await step8_clickContinue();
         default: throw new Error(`signup-page.js does not handle step ${message.step}`);
       }
@@ -33,11 +36,94 @@ async function handleCommand(message) {
   }
 }
 
+function getActionElementText(el) {
+  return [
+    el?.textContent || '',
+    el?.value || '',
+    el?.getAttribute?.('aria-label') || '',
+    el?.getAttribute?.('data-dd-action-name') || '',
+    el?.getAttribute?.('title') || '',
+  ].join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function findActionElement(pattern) {
+  const selectors = 'button, a, [role="button"], input[type="submit"], input[type="button"]';
+  const candidates = document.querySelectorAll(selectors);
+  for (const el of candidates) {
+    if (pattern.test(getActionElementText(el))) {
+      return el;
+    }
+  }
+  return null;
+}
+
+function waitForActionElement(pattern, timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    const existing = findActionElement(pattern);
+    if (existing) {
+      resolve(existing);
+      return;
+    }
+
+    const observer = new MutationObserver(() => {
+      const el = findActionElement(pattern);
+      if (el) {
+        observer.disconnect();
+        clearTimeout(timer);
+        resolve(el);
+      }
+    });
+
+    observer.observe(document.body || document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      characterData: true,
+    });
+
+    const timer = setTimeout(() => {
+      observer.disconnect();
+      reject(new Error(`Timeout waiting for action element ${pattern} on ${location.href}`));
+    }, timeout);
+  });
+}
+
+async function activateActionElement(el, label) {
+  if (!el) throw new Error(`No element provided for ${label}`);
+
+  const target = el.closest('button, a, [role="button"], input[type="submit"], input[type="button"]') || el;
+  target.scrollIntoView({ block: 'center', inline: 'nearest' });
+  await sleepRandom(120, 240);
+  if ('focus' in target) target.focus();
+  await sleepRandom(120, 240);
+
+  if ('click' in target) {
+    target.click();
+    log(`${label}: Clicked via native click()`);
+  }
+  simulateClick(target);
+
+  const form = target.form || target.closest('form');
+  if (form) {
+    try {
+      form.requestSubmit(target.tagName === 'BUTTON' || target.tagName === 'INPUT' ? target : undefined);
+      log(`${label}: Triggered form.requestSubmit()`);
+    } catch {
+      try {
+        form.submit();
+        log(`${label}: Triggered form.submit()`);
+      } catch {}
+    }
+  }
+}
+
 // ============================================================
 // Step 2: Click Register
 // ============================================================
 
 async function step2_clickRegister() {
+  log('Step 2: Waiting for page to render...');
+  await sleepRandom(1200, 2200);
   log('Step 2: Looking for Register/Sign up button...');
 
   let registerBtn = null;
@@ -72,6 +158,8 @@ async function step3_fillEmailPassword(payload) {
   const { email } = payload;
   if (!email) throw new Error('No email provided. Paste email in Side Panel first.');
 
+  log('Step 3: Waiting for signup form to render...');
+  await sleepRandom(1200, 2200);
   log(`Step 3: Filling email: ${email}`);
 
   // Find email input
@@ -100,7 +188,7 @@ async function step3_fillEmailPassword(payload) {
     if (submitBtn) {
       simulateClick(submitBtn);
       log('Step 3: Submitted email, waiting for password field...');
-      await sleep(2000);
+      await sleepRandom(1800, 3200);
     }
 
     try {
@@ -119,7 +207,7 @@ async function step3_fillEmailPassword(payload) {
   reportComplete(3, { email });
 
   // Submit the form (page will navigate away after this)
-  await sleep(500);
+  await sleepRandom(450, 900);
   const submitBtn = document.querySelector('button[type="submit"]')
     || await waitForElementByText('button', /continue|sign\s*up|submit|注册|创建|create/i, 5000).catch(() => null);
 
@@ -137,6 +225,8 @@ async function fillVerificationCode(step, payload) {
   const { code } = payload;
   if (!code) throw new Error('No verification code provided.');
 
+  log(`Step ${step}: Waiting for verification code page to render...`);
+  await sleepRandom(1200, 2200);
   log(`Step ${step}: Filling verification code: ${code}`);
 
   // Find code input — could be a single input or multiple separate inputs
@@ -155,7 +245,7 @@ async function fillVerificationCode(step, payload) {
         fillInput(singleInputs[i], code[i]);
         await sleep(100);
       }
-      await sleep(1000);
+      await sleepRandom(900, 1500);
       reportComplete(step);
       return;
     }
@@ -169,7 +259,7 @@ async function fillVerificationCode(step, payload) {
   reportComplete(step);
 
   // Submit
-  await sleep(500);
+  await sleepRandom(450, 900);
   const submitBtn = document.querySelector('button[type="submit"]')
     || await waitForElementByText('button', /verify|confirm|submit|continue|确认|验证/i, 5000).catch(() => null);
 
@@ -177,6 +267,32 @@ async function fillVerificationCode(step, payload) {
     simulateClick(submitBtn);
     log(`Step ${step}: Verification submitted`);
   }
+}
+
+async function stepResendVerificationEmail(step) {
+  log(`Step ${step}: Waiting for resend verification email button...`);
+  await sleepRandom(1200, 2200);
+
+  let resendBtn = document.querySelector(
+    'button[name="intent"][value="resend"][type="submit"], input[name="intent"][value="resend"][type="submit"]'
+  );
+  if (!resendBtn) {
+    const resendPattern = /重新发送电子邮件|重新发送|再次发送|重发|resend|send again|verification email|验证电子邮件/i;
+    resendBtn = await waitForActionElement(resendPattern, 15000).catch(() => null);
+  }
+  if (!resendBtn) {
+    throw new Error('Could not find resend verification email button on auth page.');
+  }
+
+  const disabled = resendBtn.disabled
+    || resendBtn.getAttribute('aria-disabled') === 'true'
+    || resendBtn.getAttribute('disabled') !== null;
+  if (disabled) {
+    throw new Error('Resend verification email button is disabled.');
+  }
+
+  await activateActionElement(resendBtn, `Step ${step} resend`);
+  log(`Step ${step}: Resend verification email requested`);
 }
 
 // ============================================================
@@ -187,6 +303,8 @@ async function step6_login(payload) {
   const { email, password } = payload;
   if (!email) throw new Error('No email provided for login.');
 
+  log(`Step 6: Waiting for login page to render...`);
+  await sleepRandom(1800, 3200);
   log(`Step 6: Logging in with ${email}...`);
 
   // Wait for email input on the auth page
@@ -204,7 +322,7 @@ async function step6_login(payload) {
   log('Step 6: Email filled');
 
   // Submit email
-  await sleep(500);
+  await sleepRandom(450, 900);
   const submitBtn1 = document.querySelector('button[type="submit"]')
     || await waitForElementByText('button', /continue|next|submit|继续|下一步/i, 5000).catch(() => null);
   if (submitBtn1) {
@@ -212,7 +330,7 @@ async function step6_login(payload) {
     log('Step 6: Submitted email');
   }
 
-  await sleep(2000);
+  await sleepRandom(1800, 3200);
 
   // Check for password field
   const passwordInput = document.querySelector('input[type="password"]');
@@ -220,7 +338,7 @@ async function step6_login(payload) {
     log('Step 6: Password field found, filling password...');
     fillInput(passwordInput, password);
 
-    await sleep(500);
+    await sleepRandom(450, 900);
     const submitBtn2 = document.querySelector('button[type="submit"]')
       || await waitForElementByText('button', /continue|log\s*in|submit|sign\s*in|登录|继续/i, 5000).catch(() => null);
     // Report complete BEFORE submit in case page navigates
@@ -246,37 +364,29 @@ async function step6_login(payload) {
 // Clicking it triggers redirect to localhost URL.
 
 async function step8_clickContinue() {
+  log('Step 8: Waiting for OAuth consent page to render...');
+  await sleepRandom(1800, 3200);
   log('Step 8: Looking for OAuth consent "继续" button...');
 
-  // Wait for the consent page to be ready
-  // Look for the submit button with text "继续" or data-dd-action-name="Continue"
-  let continueBtn = null;
-  try {
-    continueBtn = await waitForElement(
-      'button[type="submit"][data-dd-action-name="Continue"], button[type="submit"]._primary_3rdp0_107',
-      10000
-    );
-  } catch {
-    try {
-      continueBtn = await waitForElementByText('button', /继续|Continue/, 5000);
-    } catch {
-      throw new Error('Could not find "继续" button on OAuth consent page. URL: ' + location.href);
-    }
+  let continueBtn = document.querySelector('button[data-dd-action-name="Continue"][type="submit"], button._primary_3rdp0_107[type="submit"]');
+  const continuePattern = /(^|\s)(继续|continue)(\s|$)/i;
+  if (!continueBtn) {
+    continueBtn = findActionElement(continuePattern);
+  }
+  if (!continueBtn) {
+    continueBtn = await waitForActionElement(continuePattern, 15000).catch(() => null);
+  }
+  if (!continueBtn) {
+    continueBtn = document.querySelector('[data-dd-action-name="Continue"], button[type="submit"], input[type="submit"]');
+  }
+  if (!continueBtn) {
+    throw new Error('Could not find "继续" button on OAuth consent page. URL: ' + location.href);
   }
 
   log('Step 8: Found "继续" button, clicking...');
 
-  // Use native .click() — simulateClick (dispatchEvent) may not trigger form submit
-  continueBtn.click();
-  log('Step 8: Clicked via .click()');
-
-  // Also try submitting the form directly as a fallback
-  await sleep(500);
-  const form = continueBtn.closest('form');
-  if (form) {
-    form.requestSubmit(continueBtn);
-    log('Step 8: Also triggered form.requestSubmit()');
-  }
+  await activateActionElement(continueBtn, 'Step 8 continue');
+  await sleepRandom(450, 900);
 
   log('Step 8: Redirecting to localhost... (background will capture URL)');
 
@@ -290,6 +400,9 @@ async function step8_clickContinue() {
 async function step5_fillNameBirthday(payload) {
   const { firstName, lastName, year, month, day } = payload;
   if (!firstName || !lastName) throw new Error('No name data provided.');
+
+  log('Step 5: Waiting for name/birthday page to render...');
+  await sleepRandom(1800, 3200);
 
   const fullName = `${firstName} ${lastName}`;
   log(`Step 5: Filling name: ${fullName}, Birthday: ${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`);
@@ -379,8 +492,34 @@ async function step5_fillNameBirthday(payload) {
     }
   }
 
+  // Korean consent page: only click "allCheckboxes" once to accept all required consents.
+  await sleepRandom(250, 450);
+  const allConsentInput = document.querySelector(
+    'input[name="allCheckboxes"], input[id$="-allCheckboxes"]'
+  );
+  if (allConsentInput) {
+    if (!allConsentInput.checked) {
+      const clickable = allConsentInput.closest('label') || allConsentInput;
+      clickable.scrollIntoView({ block: 'center', inline: 'nearest' });
+      await sleepRandom(80, 180);
+      // Use native click for checkbox frameworks that rely on internal handlers.
+      clickable.click();
+      await sleepRandom(150, 300);
+
+      if (!allConsentInput.checked) {
+        // Fallback: force state and emit events for reactive forms.
+        allConsentInput.checked = true;
+        allConsentInput.dispatchEvent(new Event('input', { bubbles: true }));
+        allConsentInput.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      log('Step 5: Clicked "我同意以下所有各项" checkbox');
+    } else {
+      log('Step 5: "我同意以下所有各项" already checked');
+    }
+  }
+
   // Click "完成帐户创建" button
-  await sleep(500);
+  await sleepRandom(450, 900);
   const completeBtn = document.querySelector('button[type="submit"]')
     || await waitForElementByText('button', /完成|create|continue|finish|done|agree/i, 5000).catch(() => null);
 

@@ -44,7 +44,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     handlePollEmail(message.step, message.payload).then(result => {
       sendResponse(result);
     }).catch(err => {
-      reportError(message.step, err.message);
+      // POLL_EMAIL failures are handled by background retry/resend cycles.
+      // Do not emit STEP_ERROR here, otherwise the step waiter is rejected too early.
       sendResponse({ error: err.message });
     });
     return true;
@@ -73,9 +74,17 @@ function getCurrentMailIds() {
 // ============================================================
 
 async function handlePollEmail(step, payload) {
-  const { senderFilters, subjectFilters, maxAttempts, intervalMs } = payload;
+  const {
+    senderFilters,
+    subjectFilters,
+    maxAttempts,
+    intervalMs,
+    excludeCodes = [],
+    strictChatGPTCodeOnly = false,
+  } = payload;
 
   log(`Step ${step}: Starting email poll on 163 Mail (max ${maxAttempts} attempts)`);
+  await sleepRandom(1200, 2200);
 
   // Click inbox in sidebar to ensure we're in inbox view
   log(`Step ${step}: Waiting for sidebar...`);
@@ -98,7 +107,7 @@ async function handlePollEmail(step, payload) {
 
   if (items.length === 0) {
     await refreshInbox();
-    await sleep(2000);
+    await sleepRandom(1800, 3200);
     items = findMailItems();
   }
 
@@ -119,7 +128,7 @@ async function handlePollEmail(step, payload) {
 
     if (attempt > 1) {
       await refreshInbox();
-      await sleep(1000);
+      await sleepRandom(900, 1500);
     }
 
     const allItems = findMailItems();
@@ -142,7 +151,11 @@ async function handlePollEmail(step, payload) {
       const subjectMatch = subjectFilters.some(f => subject.toLowerCase().includes(f.toLowerCase()) || ariaLabel.includes(f.toLowerCase()));
 
       if (senderMatch || subjectMatch) {
-        const code = extractVerificationCode(subject + ' ' + ariaLabel);
+        const code = extractVerificationCode(subject + ' ' + ariaLabel, strictChatGPTCodeOnly);
+        if (code && excludeCodes.includes(code)) {
+          log(`Step ${step}: Skipping excluded code: ${code}`, 'info');
+          continue;
+        }
         if (code && !seenCodes.has(code)) {
           seenCodes.add(code);
           persistSeenCodes();
@@ -152,7 +165,7 @@ async function handlePollEmail(step, payload) {
           // Delete this email via right-click menu, WAIT for it to finish before returning
           await deleteEmail(item, step);
           // Extra wait to ensure deletion is processed
-          await sleep(1000);
+          await sleepRandom(900, 1500);
 
           return { ok: true, code, emailTimestamp: Date.now(), mailId: id };
         } else if (code && seenCodes.has(code)) {
@@ -166,7 +179,7 @@ async function handlePollEmail(step, payload) {
     }
 
     if (attempt < maxAttempts) {
-      await sleep(intervalMs);
+      await sleepRandom(intervalMs, intervalMs + 1200);
     }
   }
 
@@ -189,13 +202,13 @@ async function deleteEmail(item, step) {
     // These icons appear on hover, so we trigger mouseover first
     item.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
     item.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-    await sleep(300);
+    await sleepRandom(250, 450);
 
     const trashIcon = item.querySelector('[sign="trash"], .nui-ico-delete, [title="删除邮件"]');
     if (trashIcon) {
       trashIcon.click();
       log(`Step ${step}: Clicked trash icon`, 'ok');
-      await sleep(1500);
+      await sleepRandom(1200, 2200);
 
       // Check if item disappeared (confirm deletion)
       const stillExists = document.getElementById(item.id);
@@ -212,7 +225,7 @@ async function deleteEmail(item, step) {
     const checkbox = item.querySelector('[sign="checkbox"], .nui-chk');
     if (checkbox) {
       checkbox.click();
-      await sleep(300);
+      await sleepRandom(250, 450);
 
       // Click toolbar delete button
       const toolbarBtns = document.querySelectorAll('.nui-btn .nui-btn-text');
@@ -220,7 +233,7 @@ async function deleteEmail(item, step) {
         if (btn.textContent.replace(/\s/g, '').includes('删除')) {
           btn.closest('.nui-btn').click();
           log(`Step ${step}: Clicked toolbar delete`, 'ok');
-          await sleep(1500);
+          await sleepRandom(1200, 2200);
           return;
         }
       }
@@ -243,7 +256,7 @@ async function refreshInbox() {
     if (btn.textContent.replace(/\s/g, '') === '刷新') {
       btn.closest('.nui-btn').click();
       console.log(MAIL163_PREFIX, 'Clicked "刷新" button');
-      await sleep(800);
+      await sleepRandom(700, 1200);
       return;
     }
   }
@@ -254,7 +267,7 @@ async function refreshInbox() {
     if (btn.textContent.replace(/\s/g, '').includes('收信')) {
       btn.click();
       console.log(MAIL163_PREFIX, 'Clicked "收信" button');
-      await sleep(800);
+      await sleepRandom(700, 1200);
       return;
     }
   }
@@ -266,7 +279,12 @@ async function refreshInbox() {
 // Verification Code Extraction
 // ============================================================
 
-function extractVerificationCode(text) {
+function extractVerificationCode(text, strictChatGPTCodeOnly = false) {
+  if (strictChatGPTCodeOnly) {
+    const strictMatch = text.match(/your\s+chatgpt\s+code\s+is\s+(\d{6})/i);
+    return strictMatch ? strictMatch[1] : null;
+  }
+
   const matchCn = text.match(/(?:代码为|验证码[^0-9]*?)[\s：:]*(\d{6})/);
   if (matchCn) return matchCn[1];
 

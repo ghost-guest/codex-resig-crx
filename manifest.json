@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Multi-Page Automation",
-  "version": "1.1.0",
+  "version": "1.1.18",
   "description": "Automates multi-step OAuth registration workflow",
   "permissions": [
     "sidePanel",
@@ -9,7 +9,8 @@
     "webNavigation",
     "storage",
     "scripting",
-    "activeTab"
+    "activeTab",
+    "downloads"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -45,6 +46,13 @@
       ],
       "js": ["content/utils.js", "content/mail-163.js"],
       "all_frames": true,
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://2925.com/*"
+      ],
+      "js": ["content/utils.js", "content/mail-2925.js"],
       "run_at": "document_idle"
     }
   ],

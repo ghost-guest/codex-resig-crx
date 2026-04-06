@@ -9,6 +9,7 @@
 
 const QQ_MAIL_PREFIX = '[MultiPage:qq-mail]';
 const isTopFrame = window === window.top;
+const MAIL_TIME_GRACE_MS = 90 * 1000;
 
 console.log(QQ_MAIL_PREFIX, 'Content script loaded on', location.href, 'frame:', isTopFrame ? 'top' : 'child');
 
@@ -22,11 +23,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, reason: 'wrong-frame' });
       return;
     }
+    resetStopState();
     handlePollEmail(message.step, message.payload).then(result => {
       sendResponse(result);
     }).catch(err => {
-      // POLL_EMAIL failures are handled by background retry/resend cycles.
-      // Do not emit STEP_ERROR here, otherwise the step waiter is rejected too early.
+      if (isStopError(err)) {
+        log(`Step ${message.step}: Stopped by user.`, 'warn');
+        sendResponse({ stopped: true, error: err.message });
+        return;
+      }
       sendResponse({ error: err.message });
     });
     return true; // async response
@@ -45,6 +50,113 @@ function getCurrentMailIds() {
   return ids;
 }
 
+function getMailItemTimeText(item) {
+  const selectors = [
+    '[class*="time"]',
+    '[class*="Time"]',
+    '[class*="date"]',
+    '[class*="Date"]',
+    'time',
+  ];
+
+  for (const selector of selectors) {
+    const candidate = item.querySelector(selector);
+    const text = candidate?.textContent?.trim();
+    if (text) return text;
+  }
+
+  const itemText = item.textContent?.replace(/\s+/g, ' ').trim() || '';
+  const fallbackMatch = itemText.match(
+    /(刚刚|\d+\s*分钟前|\d+\s*小时[前内]|\d{1,2}:\d{2}|(?:昨天|前天)\s*\d{1,2}:\d{2}|\d{4}[-\/]\d{1,2}[-\/]\d{1,2}(?:\s+\d{1,2}:\d{2})?|\d{1,2}[-\/]\d{1,2}(?:\s+\d{1,2}:\d{2})?)/
+  );
+  return fallbackMatch ? fallbackMatch[1] : '';
+}
+
+function parseMailItemTimestamp(item) {
+  const raw = getMailItemTimeText(item);
+  if (!raw) return null;
+
+  const text = raw.replace(/\s+/g, ' ').trim();
+  const now = new Date();
+
+  if (/^刚刚$/.test(text)) return now.getTime();
+
+  const minuteAgo = text.match(/^(\d+)\s*分钟前$/);
+  if (minuteAgo) {
+    return now.getTime() - Number(minuteAgo[1]) * 60 * 1000;
+  }
+
+  const hourAgo = text.match(/^(\d+)\s*小时(?:前|内)?$/);
+  if (hourAgo) {
+    return now.getTime() - Number(hourAgo[1]) * 60 * 60 * 1000;
+  }
+
+  const todayTime = text.match(/^(\d{1,2}):(\d{2})$/);
+  if (todayTime) {
+    const candidate = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate(),
+      Number(todayTime[1]),
+      Number(todayTime[2]),
+      0,
+      0
+    );
+    if (candidate.getTime() - now.getTime() > 2 * 60 * 1000) {
+      candidate.setDate(candidate.getDate() - 1);
+    }
+    return candidate.getTime();
+  }
+
+  const relativeDay = text.match(/^(昨天|前天)\s*(\d{1,2}):(\d{2})$/);
+  if (relativeDay) {
+    const offset = relativeDay[1] === '昨天' ? 1 : 2;
+    return new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() - offset,
+      Number(relativeDay[2]),
+      Number(relativeDay[3]),
+      0,
+      0
+    ).getTime();
+  }
+
+  const fullDate = text.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$/);
+  if (fullDate) {
+    return new Date(
+      Number(fullDate[1]),
+      Number(fullDate[2]) - 1,
+      Number(fullDate[3]),
+      Number(fullDate[4] || 0),
+      Number(fullDate[5] || 0),
+      0,
+      0
+    ).getTime();
+  }
+
+  const shortDate = text.match(/^(\d{1,2})[-\/](\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$/);
+  if (shortDate) {
+    return new Date(
+      now.getFullYear(),
+      Number(shortDate[1]) - 1,
+      Number(shortDate[2]),
+      Number(shortDate[3] || 0),
+      Number(shortDate[4] || 0),
+      0,
+      0
+    ).getTime();
+  }
+
+  return null;
+}
+
+function isFreshTimestamp(itemTimestamp, filterAfterTimestamp) {
+  if (!filterAfterTimestamp) return true;
+  if (itemTimestamp === null || itemTimestamp === undefined) return false;
+  return itemTimestamp + MAIL_TIME_GRACE_MS >= filterAfterTimestamp;
+}
+
 // ============================================================
 // Email Polling
 // ============================================================
@@ -55,6 +167,7 @@ async function handlePollEmail(step, payload) {
     subjectFilters,
     maxAttempts,
     intervalMs,
+    filterAfterTimestamp,
     excludeCodes = [],
     strictChatGPTCodeOnly = false,
   } = payload;
@@ -74,6 +187,10 @@ async function handlePollEmail(step, payload) {
   const existingMailIds = getCurrentMailIds();
   log(`Step ${step}: Snapshotted ${existingMailIds.size} existing emails as "old"`);
 
+  log(`Step ${step}: Refreshing QQ inbox before polling...`);
+  await refreshInbox();
+  await sleepRandom(700, 1200);
+
   // Fallback after just 3 attempts (~10s). In practice, the email is usually
   // already in the list but has the same mailid (page was already open).
   const FALLBACK_AFTER = 3;
@@ -81,44 +198,61 @@ async function handlePollEmail(step, payload) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     log(`Polling QQ Mail... attempt ${attempt}/${maxAttempts}`);
 
-    // Refresh inbox (skip on first attempt, list is fresh)
+    // Refresh inbox on subsequent attempts
     if (attempt > 1) {
       await refreshInbox();
       await sleepRandom(700, 1200);
     }
 
     const allItems = document.querySelectorAll('.mail-list-page-item[data-mailid]');
-    const useFallback = attempt > FALLBACK_AFTER;
+    const useFallback = !filterAfterTimestamp && attempt > FALLBACK_AFTER;
 
     // Phase 1 (attempt 1~3): only look at NEW emails (not in snapshot)
     // Phase 2 (attempt 4+): fallback to first matching email in list
     for (const item of allItems) {
       const mailId = item.getAttribute('data-mailid');
+      const isNewMail = !existingMailIds.has(mailId);
+      const itemTimestamp = parseMailItemTimestamp(item);
+      const isFresh = isFreshTimestamp(itemTimestamp, filterAfterTimestamp);
 
-      if (!useFallback && existingMailIds.has(mailId)) continue;
+      if (!filterAfterTimestamp && !useFallback && !isNewMail) continue;
 
-      const sender = (item.querySelector('.cmp-account-nick')?.textContent || '').toLowerCase();
-      const subject = (item.querySelector('.mail-subject')?.textContent || '').toLowerCase();
-      const digest = item.querySelector('.mail-digest')?.textContent || '';
+      const rowText = (item.textContent || '').replace(/\s+/g, ' ').trim();
+      const rowTextLower = rowText.toLowerCase();
+      const sender = ((item.querySelector('.cmp-account-nick')?.textContent || '') || rowText).toLowerCase();
+      const subject = ((item.querySelector('.mail-subject')?.textContent || '') || rowText).toLowerCase();
+      const digest = item.querySelector('.mail-digest')?.textContent || rowText;
 
-      const senderMatch = senderFilters.some(f => sender.includes(f.toLowerCase()));
-      const subjectMatch = subjectFilters.some(f => subject.includes(f.toLowerCase()));
+      const senderMatch = senderFilters.some(f => sender.includes(f.toLowerCase()) || rowTextLower.includes(f.toLowerCase()));
+      const subjectMatch = subjectFilters.some(f => subject.includes(f.toLowerCase()) || rowTextLower.includes(f.toLowerCase()));
 
       if (senderMatch || subjectMatch) {
-        const code = extractVerificationCode(subject + ' ' + digest, strictChatGPTCodeOnly);
+        if (filterAfterTimestamp) {
+          if (itemTimestamp !== null && !isFresh) {
+            log(`Step ${step}: Skipping stale QQ mail (time=${getMailItemTimeText(item) || 'unknown'}, filter=${new Date(filterAfterTimestamp).toLocaleTimeString('zh-CN', { hour12: false })})`, 'info');
+            continue;
+          }
+
+          if (itemTimestamp === null && !isNewMail) {
+            log(`Step ${step}: Skipping QQ mail without parsable timestamp because it is not new after poll start.`, 'info');
+            continue;
+          }
+        }
+
+        const code = extractVerificationCode(`${subject} ${digest} ${rowText}`, strictChatGPTCodeOnly);
         if (code) {
           if (excludeCodes.includes(code)) {
             log(`Step ${step}: Skipping excluded code: ${code}`, 'info');
             continue;
           }
-          const source = useFallback && existingMailIds.has(mailId) ? 'fallback-first-match' : 'new';
+          const source = isNewMail ? 'new' : (filterAfterTimestamp ? 'fresh-existing' : 'fallback-first-match');
           log(`Step ${step}: Code found: ${code} (${source}, subject: ${subject.slice(0, 40)})`, 'ok');
-          return { ok: true, code, emailTimestamp: Date.now(), mailId };
+          return { ok: true, code, emailTimestamp: itemTimestamp || Date.now(), mailId };
         }
       }
     }
 
-    if (attempt === FALLBACK_AFTER + 1) {
+    if (!filterAfterTimestamp && attempt === FALLBACK_AFTER + 1) {
       log(`Step ${step}: No new emails after ${FALLBACK_AFTER} attempts, falling back to first matching email`, 'warn');
     }
 

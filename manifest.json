@@ -7,6 +7,8 @@
     "sidePanel",
     "tabs",
     "webNavigation",
+    "debugger",
+    "alarms",
     "storage",
     "scripting",
     "activeTab",
@@ -53,6 +55,13 @@
         "https://2925.com/*"
       ],
       "js": ["content/utils.js", "content/mail-2925.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://duckduckgo.com/email/settings/autofill*"
+      ],
+      "js": ["content/utils.js", "content/duck-mail.js"],
       "run_at": "document_idle"
     }
   ],

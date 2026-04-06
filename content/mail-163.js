@@ -41,11 +41,15 @@ async function persistSeenCodes() {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'POLL_EMAIL') {
+    resetStopState();
     handlePollEmail(message.step, message.payload).then(result => {
       sendResponse(result);
     }).catch(err => {
-      // POLL_EMAIL failures are handled by background retry/resend cycles.
-      // Do not emit STEP_ERROR here, otherwise the step waiter is rejected too early.
+      if (isStopError(err)) {
+        log(`Step ${message.step}: Stopped by user.`, 'warn');
+        sendResponse({ stopped: true, error: err.message });
+        return;
+      }
       sendResponse({ error: err.message });
     });
     return true;
@@ -120,6 +124,10 @@ async function handlePollEmail(step, payload) {
   // Snapshot existing mail IDs
   const existingMailIds = getCurrentMailIds();
   log(`Step ${step}: Snapshotted ${existingMailIds.size} existing emails`);
+
+  log(`Step ${step}: Refreshing 163 inbox before polling...`);
+  await refreshInbox();
+  await sleepRandom(900, 1500);
 
   const FALLBACK_AFTER = 3;
 

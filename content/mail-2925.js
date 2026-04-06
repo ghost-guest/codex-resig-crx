@@ -19,11 +19,15 @@ if (!isTopFrame) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'POLL_EMAIL') {
+    resetStopState();
     handlePollEmail(message.step, message.payload).then(result => {
       sendResponse(result);
     }).catch(err => {
-      // POLL_EMAIL failures are handled by background retry/resend cycles.
-      // Do not emit STEP_ERROR here, otherwise the step waiter is rejected too early.
+      if (isStopError(err)) {
+        log(`Step ${message.step}: Stopped by user.`, 'warn');
+        sendResponse({ stopped: true, error: err.message });
+        return;
+      }
       sendResponse({ error: err.message });
     });
     return true;
@@ -250,6 +254,10 @@ async function handlePollEmail(step, payload) {
 
   // 等待页面基本加载
   await sleepRandom(1800, 3200);
+
+  log(`Step ${step}: Refreshing 2925 inbox before polling...`);
+  await refreshInbox();
+  await sleepRandom(900, 1500);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     log(`Polling 2925 Mail... attempt ${attempt}/${maxAttempts}`);

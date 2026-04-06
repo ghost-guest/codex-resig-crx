@@ -1,26 +1,47 @@
 // content/utils.js — Shared utilities for all content scripts
 
-const SCRIPT_SOURCE = (() => {
+var SCRIPT_SOURCE = (() => {
+  if (window.__MULTIPAGE_SOURCE) return window.__MULTIPAGE_SOURCE;
   const url = location.href;
   if (url.includes('auth0.openai.com') || url.includes('auth.openai.com') || url.includes('accounts.openai.com')) return 'signup-page';
   if (url.includes('mail.qq.com')) return 'qq-mail';
   if (url.includes('mail.163.com')) return 'mail-163';
   if (url.includes('2925.com')) return 'mail-2925';
+  if (url.includes('duckduckgo.com/email/settings/autofill')) return 'duck-mail';
   if (url.includes('chatgpt.com')) return 'chatgpt';
-  // VPS panel — detected dynamically since URL is configurable
   return 'vps-panel';
 })();
 
-const LOG_PREFIX = `[MultiPage:${SCRIPT_SOURCE}]`;
+var LOG_PREFIX = `[MultiPage:${SCRIPT_SOURCE}]`;
+var STOP_ERROR_MESSAGE = 'Flow stopped by user.';
+var flowStopped = false;
 
-/**
- * Wait for a DOM element to appear.
- * @param {string} selector - CSS selector
- * @param {number} timeout - Max wait time in ms (default 10000)
- * @returns {Promise<Element>}
- */
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === 'STOP_FLOW') {
+    flowStopped = true;
+    console.warn(LOG_PREFIX, STOP_ERROR_MESSAGE);
+  }
+});
+
+function resetStopState() {
+  flowStopped = false;
+}
+
+function isStopError(error) {
+  const message = typeof error === 'string' ? error : error?.message;
+  return message === STOP_ERROR_MESSAGE;
+}
+
+function throwIfStopped() {
+  if (flowStopped) {
+    throw new Error(STOP_ERROR_MESSAGE);
+  }
+}
+
 function waitForElement(selector, timeout = 10000) {
   return new Promise((resolve, reject) => {
+    throwIfStopped();
+
     const existing = document.querySelector(selector);
     if (existing) {
       console.log(LOG_PREFIX, `Found immediately: ${selector}`);
@@ -32,11 +53,25 @@ function waitForElement(selector, timeout = 10000) {
     console.log(LOG_PREFIX, `Waiting for: ${selector} (timeout: ${timeout}ms)`);
     log(`Waiting for selector: ${selector}...`);
 
+    let settled = false;
+    let stopTimer = null;
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      observer.disconnect();
+      clearTimeout(timer);
+      clearTimeout(stopTimer);
+    };
+
     const observer = new MutationObserver(() => {
+      if (flowStopped) {
+        cleanup();
+        reject(new Error(STOP_ERROR_MESSAGE));
+        return;
+      }
       const el = document.querySelector(selector);
       if (el) {
-        observer.disconnect();
-        clearTimeout(timer);
+        cleanup();
         console.log(LOG_PREFIX, `Found after wait: ${selector}`);
         log(`Found element: ${selector}`);
         resolve(el);
@@ -49,23 +84,29 @@ function waitForElement(selector, timeout = 10000) {
     });
 
     const timer = setTimeout(() => {
-      observer.disconnect();
+      cleanup();
       const msg = `Timeout waiting for ${selector} after ${timeout}ms on ${location.href}`;
       console.error(LOG_PREFIX, msg);
       reject(new Error(msg));
     }, timeout);
+
+    const pollStop = () => {
+      if (settled) return;
+      if (flowStopped) {
+        cleanup();
+        reject(new Error(STOP_ERROR_MESSAGE));
+        return;
+      }
+      stopTimer = setTimeout(pollStop, 100);
+    };
+    pollStop();
   });
 }
 
-/**
- * Wait for an element matching a text pattern among multiple candidates.
- * @param {string} containerSelector - Selector for candidate elements
- * @param {RegExp} textPattern - Regex to match against textContent
- * @param {number} timeout - Max wait time in ms
- * @returns {Promise<Element>}
- */
 function waitForElementByText(containerSelector, textPattern, timeout = 10000) {
   return new Promise((resolve, reject) => {
+    throwIfStopped();
+
     function search() {
       const candidates = document.querySelectorAll(containerSelector);
       for (const el of candidates) {
@@ -87,11 +128,25 @@ function waitForElementByText(containerSelector, textPattern, timeout = 10000) {
     console.log(LOG_PREFIX, `Waiting for text match: ${containerSelector} / ${textPattern}`);
     log(`Waiting for element with text: ${textPattern}...`);
 
+    let settled = false;
+    let stopTimer = null;
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      observer.disconnect();
+      clearTimeout(timer);
+      clearTimeout(stopTimer);
+    };
+
     const observer = new MutationObserver(() => {
+      if (flowStopped) {
+        cleanup();
+        reject(new Error(STOP_ERROR_MESSAGE));
+        return;
+      }
       const el = search();
       if (el) {
-        observer.disconnect();
-        clearTimeout(timer);
+        cleanup();
         console.log(LOG_PREFIX, `Found by text after wait: ${textPattern}`);
         log(`Found element by text: ${textPattern}`);
         resolve(el);
@@ -104,21 +159,27 @@ function waitForElementByText(containerSelector, textPattern, timeout = 10000) {
     });
 
     const timer = setTimeout(() => {
-      observer.disconnect();
+      cleanup();
       const msg = `Timeout waiting for text "${textPattern}" in "${containerSelector}" after ${timeout}ms on ${location.href}`;
       console.error(LOG_PREFIX, msg);
       reject(new Error(msg));
     }, timeout);
+
+    const pollStop = () => {
+      if (settled) return;
+      if (flowStopped) {
+        cleanup();
+        reject(new Error(STOP_ERROR_MESSAGE));
+        return;
+      }
+      stopTimer = setTimeout(pollStop, 100);
+    };
+    pollStop();
   });
 }
 
-/**
- * React-compatible form filling.
- * Sets value via native setter and dispatches input + change events.
- * @param {HTMLInputElement} el
- * @param {string} value
- */
 function fillInput(el, value) {
+  throwIfStopped();
   const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
     window.HTMLInputElement.prototype,
     'value'
@@ -130,23 +191,14 @@ function fillInput(el, value) {
   log(`Filled input [${el.name || el.id || el.type || 'unknown'}]`);
 }
 
-/**
- * Fill a select element by setting its value and triggering change.
- * @param {HTMLSelectElement} el
- * @param {string} value
- */
 function fillSelect(el, value) {
+  throwIfStopped();
   el.value = value;
   el.dispatchEvent(new Event('change', { bubbles: true }));
   console.log(LOG_PREFIX, `Selected value ${value} in ${el.name || el.id}`);
   log(`Selected [${el.name || el.id || 'unknown'}] = ${value}`);
 }
 
-/**
- * Send a log message to Side Panel via Background.
- * @param {string} message
- * @param {string} level - 'info' | 'ok' | 'warn' | 'error'
- */
 function log(message, level = 'info') {
   chrome.runtime.sendMessage({
     type: 'LOG',
@@ -157,9 +209,6 @@ function log(message, level = 'info') {
   });
 }
 
-/**
- * Report that this content script is loaded and ready.
- */
 function reportReady() {
   console.log(LOG_PREFIX, 'Content script ready');
   chrome.runtime.sendMessage({
@@ -171,11 +220,6 @@ function reportReady() {
   });
 }
 
-/**
- * Report step completion.
- * @param {number} step
- * @param {Object} data - Step output data
- */
 function reportComplete(step, data = {}) {
   console.log(LOG_PREFIX, `Step ${step} completed`, data);
   log(`Step ${step} completed successfully`, 'ok');
@@ -188,11 +232,6 @@ function reportComplete(step, data = {}) {
   });
 }
 
-/**
- * Report step error.
- * @param {number} step
- * @param {string} errorMessage
- */
 function reportError(step, errorMessage) {
   console.error(LOG_PREFIX, `Step ${step} failed: ${errorMessage}`);
   log(`Step ${step} failed: ${errorMessage}`, 'error');
@@ -205,31 +244,33 @@ function reportError(step, errorMessage) {
   });
 }
 
-/**
- * Simulate a click with proper event dispatching.
- * @param {Element} el
- */
 function simulateClick(el) {
+  throwIfStopped();
   el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
   console.log(LOG_PREFIX, `Clicked: ${el.tagName} ${el.textContent?.slice(0, 30) || ''}`);
   log(`Clicked [${el.tagName}] "${el.textContent?.trim().slice(0, 30) || ''}"`);
 }
 
-/**
- * Wait a specified number of milliseconds.
- * @param {number} ms
- * @returns {Promise<void>}
- */
 function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+
+    function tick() {
+      if (flowStopped) {
+        reject(new Error(STOP_ERROR_MESSAGE));
+        return;
+      }
+      if (Date.now() - start >= ms) {
+        resolve();
+        return;
+      }
+      setTimeout(tick, Math.min(100, Math.max(25, ms - (Date.now() - start))));
+    }
+
+    tick();
+  });
 }
 
-/**
- * Wait a random number of milliseconds within a range.
- * @param {number} minMs
- * @param {number} maxMs
- * @returns {Promise<void>}
- */
 function sleepRandom(minMs, maxMs = minMs) {
   const lower = Math.max(0, Math.min(minMs, maxMs));
   const upper = Math.max(minMs, maxMs);
@@ -237,11 +278,17 @@ function sleepRandom(minMs, maxMs = minMs) {
   return sleep(delay);
 }
 
-// Auto-report ready on load — only for pages with a known SCRIPT_SOURCE.
-// Skip child iframes of mail pages to avoid overwriting the top frame's registration.
-// For the VPS panel (user-configurable URL, SCRIPT_SOURCE defaults to 'vps-panel'),
-// reportReady is NOT called here; vps-panel.js calls it explicitly instead.
-const _isMailChildFrame = (SCRIPT_SOURCE === 'qq-mail' || SCRIPT_SOURCE === 'mail-163') && window !== window.top;
+async function humanPause(min = 250, max = 850) {
+  const duration = Math.floor(Math.random() * (max - min + 1)) + min;
+  await sleep(duration);
+}
+
+const _isMailChildFrame = (
+  SCRIPT_SOURCE === 'qq-mail'
+  || SCRIPT_SOURCE === 'mail-163'
+  || SCRIPT_SOURCE === 'mail-2925'
+  || SCRIPT_SOURCE === 'inbucket-mail'
+) && window !== window.top;
 const _knownSource = SCRIPT_SOURCE !== 'vps-panel';
 if (_knownSource && !_isMailChildFrame) {
   reportReady();
